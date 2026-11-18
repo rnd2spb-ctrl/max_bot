@@ -23,6 +23,8 @@ README-ЗАМЕТКА (прочитайте перед запуском)
     # MAX_UNSUBSCRIBE_WEBHOOK, LOG_LEVEL, LOG_DIR (папка журналов, по умолчанию logs рядом
     # со скриптом), LOG_KEEP_RUNS (сколько запусков хранить, по умолчанию 10),
     # OPENROUTER_REFERER, OPENROUTER_TITLE, POLL_TIMEOUT, POLL_LIMIT
+    # MAX_BOT_NAME=имя_бота        # имя бота для персональных ссылок https://max.ru/<имя>?start=...
+    # INVITE_TTL_HOURS=72          # срок действия персональной ссылки, часов (по умолчанию 72)
     # (значения по умолчанию см. раздел «Настройки» ниже)
 
 ВАЖНО про модель. В образце limit_openrouter.py использовалась модель
@@ -52,11 +54,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
 import random
 import re
+import secrets
 import signal
 import sqlite3
 import struct
@@ -163,6 +167,8 @@ class Config:
     poll_limit: int = 100
     log_dir: Path = SCRIPT_DIR / "logs"
     log_keep_runs: int = 10
+    bot_name: str = ""             # имя бота для ссылок https://max.ru/<имя>?start=...
+    invite_ttl_hours: int = 72     # срок действия персональной ссылки
 
 
 def _int(env: Mapping[str, str], name: str, default: int, lo: int, hi: int) -> int:
@@ -214,6 +220,8 @@ def build_config(env: Mapping[str, str]) -> Config:
         poll_limit=_int(env, "POLL_LIMIT", 100, 1, 1000),
         log_dir=Path((env.get("LOG_DIR") or "").strip() or SCRIPT_DIR / "logs"),
         log_keep_runs=_int(env, "LOG_KEEP_RUNS", 10, 1, 1000),
+        bot_name=(env.get("MAX_BOT_NAME") or "").strip().lstrip("@"),
+        invite_ttl_hours=_int(env, "INVITE_TTL_HOURS", 72, 1, 720),
     )
 
 
@@ -230,6 +238,8 @@ def load_config() -> Config:
     log_file = configure_logging(CFG.log_level, CFG.log_dir, CFG.log_keep_runs)
     register_secrets(CFG.bot_token, CFG.openrouter_api_key)
     log.info("журнал: экран и файл %s (хранится запусков: %d)", log_file or "(файл не создан)", CFG.log_keep_runs)
+    if not CFG.bot_name:
+        log.warning("MAX_BOT_NAME не задан: ссылки-приглашения будут без адреса бота (впишите имя бота в .env)")
     log.info("настройки: .env %s; модель=%s; БД=%s; архив=%s дн.; пояс=%s; webhook-снятие=%s",
              f"найден (переменных из файла: {len(loaded)})" if ENV_PATH.exists() else "не найден, использую окружение",
              CFG.openrouter_model, CFG.db_path, CFG.archive_days, CFG.tz.key,
@@ -382,6 +392,12 @@ CREATE TABLE IF NOT EXISTS request_log (ts REAL, user_id INTEGER, text TEXT);
 CREATE TABLE IF NOT EXISTS inbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, payload TEXT NOT NULL,
     done INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+    created_ts REAL NOT NULL, expires_ts REAL NOT NULL,
+    status TEXT NOT NULL,              -- ожидает | ждёт подтверждения | подключён | отозвана | истекла
+    user_id INTEGER, used_ts REAL);
+CREATE TABLE IF NOT EXISTS link_attempts (user_id INTEGER NOT NULL, ts REAL NOT NULL);
 """
 
 
@@ -474,6 +490,75 @@ def mark_started(user_id: int) -> None:
 
 def has_started(user_id: int) -> bool:
     return bool(q("SELECT 1 FROM started WHERE user_id = ?", (user_id,)))
+
+
+# ---------- персональные ссылки-приглашения ----------
+# В базе хранится только SHA-256 от токена: сам токен виден владельцу один раз (при создании).
+LINK_ATTEMPTS_PER_HOUR = 5
+OPEN_INVITE = ("ожидает", "ждёт подтверждения")
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_invite(name: str) -> str:
+    """Создаёт одноразовую ссылку для имени и возвращает токен."""
+    token = secrets.token_urlsafe(16)                # 22 знака из A-Za-z0-9_-, с запасом до лимита 128
+    now = time.time()
+    db("INSERT INTO invites (name, token_hash, created_ts, expires_ts, status) VALUES (?, ?, ?, ?, 'ожидает')",
+       (name, hash_token(token), now, now + CFG.invite_ttl_hours * 3600))
+    return token
+
+
+def invite_link(token: str) -> str:
+    if CFG.bot_name:
+        return f"https://max.ru/{CFG.bot_name}?start={token}"
+    return f"start={token} (задайте MAX_BOT_NAME, тогда будет готовая ссылка)"
+
+
+def invite_view(status: str, expires_ts: float, user_id: Optional[int]) -> str:
+    """Статус приглашения для владельца (срок истечения вычисляется на лету)."""
+    if status in OPEN_INVITE and expires_ts < time.time():
+        return "истекла"
+    if status == "ожидает":
+        return f"ожидает, действует до {fmt_ts(expires_ts)}"
+    if status == "ждёт подтверждения":
+        return f"ждёт подтверждения имени (ID {user_id})"
+    if status == "подключён":
+        return f"подключён (ID {user_id})"
+    return status                                     # отозвана, истекла
+
+
+def name_busy(name: str) -> Optional[str]:
+    """Причина, по которой имя занято, или None."""
+    if q("SELECT 1 FROM recipients WHERE lower(name) = lower(?)", (name,)):
+        return "уже подключён(а) как получатель"
+    if q("SELECT 1 FROM invites WHERE lower(name) = lower(?) AND status IN ('ожидает', 'ждёт подтверждения')",
+         (name,)):
+        return "уже есть неиспользованная ссылка (чтобы заменить: /newlink имя)"
+    return None
+
+
+def parse_names(text: str) -> list[str]:
+    """Имена из текста: каждое с новой строки (пустые строки пропускаются)."""
+    return [n.strip() for n in text.splitlines() if n.strip()]
+
+
+def make_links(names: list[str]) -> str:
+    """Создаёт ссылки для имён и возвращает текст ответа владельцу."""
+    lines = []
+    for name in names:
+        if len(name) > 40:
+            lines.append(f"{name[:40]}…: слишком длинное имя (до 40 знаков)")
+            continue
+        busy = name_busy(name)
+        if busy:
+            lines.append(f"{name}: {busy}")
+            continue
+        lines.append(f"{name}: {invite_link(create_invite(name))}")
+    return ("\n".join(lines) + f"\n\nКаждая ссылка одноразовая, действует {CFG.invite_ttl_hours} ч. "
+            "Перешлите её получателю. Статусы: /links").strip()
 
 
 # ---------- входящая очередь: защита от потери событий ----------
@@ -1145,8 +1230,69 @@ async def handle_recipient_request(client: httpx.AsyncClient, user_id: int, text
 # =====================================================================
 # 8. КОМАНДЫ ВЛАДЕЛЬЦА
 # =====================================================================
+async def handle_invite_start(client: httpx.AsyncClient, uid: int, token: str, name: str) -> None:
+    """Пользователь открыл персональную ссылку (bot_started с payload)."""
+    now = time.time()
+    db("DELETE FROM link_attempts WHERE ts < ?", (now - 86400,))
+    db("INSERT INTO link_attempts (user_id, ts) VALUES (?, ?)", (uid, now))
+    tries = q("SELECT COUNT(*) FROM link_attempts WHERE user_id = ? AND ts > ?", (uid, now - 3600))[0][0]
+    if tries > LINK_ATTEMPTS_PER_HOUR:
+        log.warning("слишком много попыток по ссылке: user_id=%s", uid)
+        await alert_owner(f"ID {uid} ({name or 'без имени'}) слишком часто открывает ссылку-приглашение. "
+                          "Ответ ему временно не отправляется.", key=f"linkrl:{uid}", every=3600.0)
+        return
+    if is_recipient(uid):
+        await send_text(client, uid, "Вы уже подключены и получаете результаты.")
+        return
+    row = q("SELECT id, name, status, expires_ts, user_id FROM invites WHERE token_hash = ?", (hash_token(token),))
+    inv = row[0] if row else None
+    usable = inv is not None and (inv[2] == "ожидает" or (inv[2] == "ждёт подтверждения" and inv[4] == uid))
+    if not usable:
+        log.info("неизвестная или занятая ссылка от user_id=%s", uid)
+        await send_text(client, uid, "Ссылка недействительна, уже использована или истекла. "
+                                     "Попросите отправителя прислать новую.")
+        await alert_owner(f"По ссылке-приглашению пришёл неверный или уже использованный токен: "
+                          f"ID {uid} ({name or 'без имени'}).", key=f"badlink:{uid}", every=3600.0)
+        return
+    inv_id, inv_name, status, expires, _ = inv
+    if expires < now:
+        db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
+        await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
+        return
+    db("UPDATE invites SET status = 'ждёт подтверждения', user_id = ? WHERE id = ?", (uid, inv_id))
+    log.info("ссылка открыта: приглашение #%s, user_id=%s", inv_id, uid)
+    await send_text(client, uid, f"Здравствуйте! Вас приглашают получать результаты работы бота. "
+                                 f"Вы — {inv_name}? Ответьте «да», чтобы подтвердить.")
+
+
+async def handle_invite_reply(client: httpx.AsyncClient, uid: int, text: str) -> bool:
+    """Ответ пользователя на вопрос «Вы — <имя>?». True, если сообщение относится к приглашению."""
+    row = q("SELECT id, name, expires_ts FROM invites WHERE user_id = ? AND status = 'ждёт подтверждения'", (uid,))
+    if not row:
+        return False
+    inv_id, name, expires = row[0]
+    now = time.time()
+    if expires < now:
+        db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
+        await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
+        return True
+    if text.strip().lower() != "да":
+        await send_text(client, uid, f"Чтобы подтвердить, что вы — {name}, ответьте «да».")
+        return True
+    db("UPDATE invites SET status = 'подключён', used_ts = ? WHERE id = ?", (now, inv_id))
+    db("INSERT OR IGNORE INTO recipients (user_id, name, active) VALUES (?, ?, 1)", (uid, name))
+    mark_started(uid)
+    log.info("получатель подключён по приглашению #%s: user_id=%s", inv_id, uid)
+    await send_text(client, uid, "Готово, вы подключены: будете получать результаты.")
+    await alert_owner(f"{name} (ID {uid}) подключился(ась) по ссылке.", key=f"linked:{inv_id}", every=60.0)
+    return True
+
+
 HELP = """/recipients — список получателей
-/add [имя] [ID] — добавить получателя
+/add [имя] — создать персональную ссылку (можно несколько имён, каждое с новой строки)
+/links — статусы ссылок
+/newlink [имя] — заменить неиспользованную ссылку новой
+/revoke [имя] — отозвать неиспользованную ссылку
 /remove [имя или ID] — удалить получателя
 /pause [имя или ID] — временно не слать получателю
 /resume [имя или ID] — снова слать получателю
@@ -1160,8 +1306,9 @@ HELP = """/recipients — список получателей
 
 
 async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: str) -> None:
-    cmd, _, arg = text.partition(" ")
-    cmd, arg = cmd.lower(), arg.strip()
+    parts = text.strip().split(None, 1)              # перенос строки тоже разделяет команду и аргумент
+    cmd = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
     log.info("команда владельца: %s", cmd)
 
     async def reply(s: str) -> None:
@@ -1174,15 +1321,35 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
         await reply("\n".join(f"{n} — {u} — {'активен' if a else 'отключён'}" for u, n, a in rows)
                     or "Получателей нет.")
     elif cmd == "/add":
-        parsed = parse_add(arg)
-        if not parsed:
-            await reply("Формат: /add [имя] [ID]")
-        elif is_recipient(parsed[1]):
-            await reply(f"Получатель с ID {parsed[1]} уже есть.")
+        names = parse_names(arg)
+        if not names:
+            await reply("Формат: /add Имя. Несколько имён — каждое с новой строки.")
         else:
-            db("INSERT INTO recipients (user_id, name) VALUES (?, ?)", (parsed[1], parsed[0]))
-            await reply(f"Добавлен: {parsed[0]} ({parsed[1]}). Получатель должен сам открыть бота "
-                        "и нажать Start, иначе сообщения ему не дойдут.")
+            await reply(make_links(names))
+    elif cmd == "/links":
+        rows = q("SELECT name, status, expires_ts, user_id FROM invites ORDER BY id DESC LIMIT 50")
+        await reply("\n".join(f"{n} — {invite_view(s, e, u)}" for n, s, e, u in rows)
+                    or "Ссылок ещё не создавали. Создать: /add Имя.")
+    elif cmd == "/newlink":
+        if not arg:
+            await reply("Формат: /newlink Имя")
+        elif find_recipient(arg):
+            await reply(f"{arg} уже подключён(а). Новая ссылка нужна до подключения; чтобы заменить "
+                        "получателя, сначала /remove.")
+        else:
+            n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
+                   "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
+            log.info("перевыпуск ссылки: %s, отозвано старых: %s", arg, n)
+            await reply(make_links([arg]))
+    elif cmd == "/revoke":
+        n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
+               "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
+        if n:
+            await reply(f"Ссылка для «{arg}» отозвана. Старая ссылка больше не работает.")
+        elif find_recipient(arg):
+            await reply(f"{arg} уже подключён(а): чтобы убрать из рассылки, используйте /remove.")
+        else:
+            await reply(f"Активной ссылки для «{arg}» нет.")
     elif cmd == "/remove":
         rec = find_recipient(arg)
         if not rec:
@@ -1274,9 +1441,9 @@ def wizard_question(step: str) -> str:
         return ("Шаг 1 из 3: промпт для нейросети. Ответьте «да», чтобы принять стандартный "
                 "(посмотреть: /prompt), или пришлите свой текст.")
     if step == "recipients":
-        return ("Шаг 2 из 3: получатели. Присылайте по одному в формате «имя ID». "
-                "Каждый получатель должен сам нажать Start в боте. "
-                "Когда закончите, напишите «готово».")
+        return ("Шаг 2 из 3: получатели. Присылайте имена (по одному или списком, каждое с новой строки): "
+                "для каждого создам персональную ссылку. Перешлите её получателю: он откроет ссылку, "
+                "нажмёт Start и подтвердит своё имя. Когда закончите, напишите «готово».")
     return "Шаг 3 из 3: проверьте настройку. Ответьте «да» для завершения."
 
 
@@ -1303,14 +1470,11 @@ async def setup_wizard(client: httpx.AsyncClient, uid: int, text: str) -> None:
             recs = "\n".join(f"{n} — {u}" for u, n in active_recipients()) or "нет"
             await say(f"Промпт:\n{get_prompt()[:300]}\n\nПолучатели:\n{recs}\n\n" + wizard_question("confirm"))
             return
-        parsed = parse_add(text)
-        if not parsed:
-            await say("Формат: имя ID. Или напишите «готово».")
-        elif is_recipient(parsed[1]):
-            await say(f"Получатель с ID {parsed[1]} уже есть.")
+        names = parse_names(text)
+        if not names:
+            await say("Пришлите имя получателя или напишите «готово».")
         else:
-            db("INSERT INTO recipients (user_id, name) VALUES (?, ?)", (parsed[1], parsed[0]))
-            await say(f"Добавлен: {parsed[0]} ({parsed[1]}). Следующий или «готово».")
+            await say(make_links(names) + "\n\nПришлите следующее имя или напишите «готово».")
     else:  # confirm
         if text.lower() == "да":
             set_setting("setup_done", "1")
@@ -1410,10 +1574,10 @@ async def handle_owner(client: httpx.AsyncClient, uid: int, m: dict) -> None:
 # 11. ОБРАБОТКА ОДНОГО ОБНОВЛЕНИЯ (фоновая задача)
 # =====================================================================
 def stranger_text(uid: int, name: str) -> str:
-    """Сообщение владельцу о незнакомом пользователе: его ID нужен для /add."""
+    """Сообщение владельцу о незнакомом пользователе, который написал боту без приглашения."""
     who = f", имя «{name}»" if name else ""
-    return (f"Незнакомый пользователь написал боту или нажал Start: ID {uid}{who}. "
-            f"Если это получатель, добавьте его: /add Имя {uid}")
+    return (f"Незнакомый пользователь (без приглашения): ID {uid}{who}. "
+            "Если это получатель, создайте ему ссылку: /add Имя")
 
 
 async def process(update: dict, client: httpx.AsyncClient, replayed: bool = False) -> None:
@@ -1421,7 +1585,12 @@ async def process(update: dict, client: httpx.AsyncClient, replayed: bool = Fals
     в seen (процесс упал до освобождения), поэтому проверку дубликата для него пропускаем."""
     if update.get("update_type") == "bot_started":
         uid = (update.get("user") or {}).get("user_id")
-        log.info("bot_started: user_id=%s (chat_id=%s)", uid, update.get("chat_id"))
+        payload = (update.get("payload") or "").strip()
+        log.info("bot_started: user_id=%s (chat_id=%s)%s", uid, update.get("chat_id"),
+                 " по ссылке-приглашению" if payload else "")
+        if uid is not None and payload and uid != CFG.owner_id:
+            await handle_invite_start(client, uid, payload, display_name(update.get("user")))
+            return
         if uid is not None:
             first = not has_started(uid)
             mark_started(uid)
@@ -1469,6 +1638,8 @@ async def process(update: dict, client: httpx.AsyncClient, replayed: bool = Fals
         else:
             log.info("дубликат mid=%s", mid)
     else:
+        if await handle_invite_reply(client, uid, m["text"]):   # ответ «да» на вопрос «Вы — <имя>?»
+            return
         log.info("чужой отправитель user_id=%s", uid)
         if first_time_stranger(uid):
             await send_text(client, uid, MSG["not_invited"])
