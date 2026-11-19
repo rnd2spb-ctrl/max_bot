@@ -19,12 +19,13 @@ README-ЗАМЕТКА (прочитайте перед запуском)
     OWNER_ID=123456              # user_id владельца в MAX (обязательно)
     OPENROUTER_API_KEY=...       # ключ OpenRouter (обязательно)
     OPENROUTER_MODEL=vendor/model-with-vision   # модель OpenRouter (обязательно)
+    MAX_BOT_NAME=имя_бота        # имя бота из адреса https://max.ru/имя_бота; без него команда /add
+                                 # не создаёт ссылки-приглашения
     # необязательные: DB_PATH, SAVE_DIR, MAX_IMAGE_BYTES, ARCHIVE_DAYS, BOT_TZ,
     # MAX_UNSUBSCRIBE_WEBHOOK, LOG_LEVEL, LOG_DIR (папка журналов, по умолчанию logs рядом
     # со скриптом), LOG_KEEP_RUNS (сколько запусков хранить, по умолчанию 10),
-    # OPENROUTER_REFERER, OPENROUTER_TITLE, POLL_TIMEOUT, POLL_LIMIT
-    # MAX_BOT_NAME=имя_бота        # имя бота для персональных ссылок https://max.ru/<имя>?start=...
-    # INVITE_TTL_HOURS=72          # срок действия персональной ссылки, часов (по умолчанию 72)
+    # OPENROUTER_REFERER, OPENROUTER_TITLE, POLL_TIMEOUT, POLL_LIMIT,
+    # INVITE_TTL_HOURS (срок действия ссылки-приглашения, часов; по умолчанию 72)
     # (значения по умолчанию см. раздел «Настройки» ниже)
 
 ВАЖНО про модель. В образце limit_openrouter.py использовалась модель
@@ -401,12 +402,19 @@ CREATE TABLE IF NOT EXISTS link_attempts (user_id INTEGER NOT NULL, ts REAL NOT 
 """
 
 
+def _lower_unicode(value: Any) -> Any:
+    return value.lower() if isinstance(value, str) else value
+
+
 def init_db(path: Optional[str] = None) -> None:
     """Открывает (создаёт) базу. Вызывается один раз при старте."""
     global _db
     if _db is not None:
         _db.close()
     _db = sqlite3.connect(path or CFG.db_path, check_same_thread=False)
+    # Встроенный lower() в SQLite понимает только латиницу: «анна» не находила «Анна».
+    # Подменяем его версией Python, которая работает с кириллицей и любым Unicode.
+    _db.create_function("lower", 1, _lower_unicode, deterministic=True)
     _db.executescript(SCHEMA)
     _db.commit()
 
@@ -512,9 +520,11 @@ def create_invite(name: str) -> str:
 
 
 def invite_link(token: str) -> str:
-    if CFG.bot_name:
-        return f"https://max.ru/{CFG.bot_name}?start={token}"
-    return f"start={token} (задайте MAX_BOT_NAME, тогда будет готовая ссылка)"
+    """Формирует полную персональную ссылку; без имени бота ссылка недопустима."""
+    # Защитная проверка нужна и здесь: функцию могут вызвать в обход make_links().
+    if not CFG.bot_name:
+        raise ConfigError("Не задан MAX_BOT_NAME: персональную ссылку сформировать нельзя.")
+    return f"https://max.ru/{CFG.bot_name}?start={token}"
 
 
 def invite_view(status: str, expires_ts: float, user_id: Optional[int]) -> str:
@@ -531,11 +541,19 @@ def invite_view(status: str, expires_ts: float, user_id: Optional[int]) -> str:
 
 
 def name_busy(name: str) -> Optional[str]:
-    """Причина, по которой имя занято, или None."""
+    """Возвращает причину занятости имени или None.
+
+    Сравнение lower() выполняется зарегистрированной в init_db() функцией Python,
+    поэтому одинаковые русские имена с разным регистром считаются одним именем.
+    Просроченные приглашения не блокируют повторное создание ссылки.
+    """
     if q("SELECT 1 FROM recipients WHERE lower(name) = lower(?)", (name,)):
         return "уже подключён(а) как получатель"
-    if q("SELECT 1 FROM invites WHERE lower(name) = lower(?) AND status IN ('ожидает', 'ждёт подтверждения')",
-         (name,)):
+
+    # Приглашение считается занятым только пока оно не отозвано и ещё действует.
+    if q("SELECT 1 FROM invites WHERE lower(name) = lower(?) "
+         "AND status IN ('ожидает', 'ждёт подтверждения') AND expires_ts >= ?",
+         (name, time.time())):
         return "уже есть неиспользованная ссылка (чтобы заменить: /newlink имя)"
     return None
 
@@ -546,7 +564,12 @@ def parse_names(text: str) -> list[str]:
 
 
 def make_links(names: list[str]) -> str:
-    """Создаёт ссылки для имён и возвращает текст ответа владельцу."""
+    """Создаёт ссылки для имён и возвращает текст ответа владельцу.
+    Ссылка показывается ТОЛЬКО здесь, один раз: в базе лежит лишь хеш токена. Поэтому без
+    MAX_BOT_NAME ссылки не создаются вообще: показанная без адреса бота ссылка была бы потеряна."""
+    if not CFG.bot_name:
+        return ("Ссылки не созданы: не задано имя бота. Впишите в файл .env строку "
+                "MAX_BOT_NAME=имя_бота (имя из адреса https://max.ru/имя_бота) и перезапустите бота.")
     lines = []
     for name in names:
         if len(name) > 40:
@@ -558,20 +581,34 @@ def make_links(names: list[str]) -> str:
             continue
         lines.append(f"{name}: {invite_link(create_invite(name))}")
     return ("\n".join(lines) + f"\n\nКаждая ссылка одноразовая, действует {CFG.invite_ttl_hours} ч. "
-            "Перешлите её получателю. Статусы: /links").strip()
+            "Ссылка показывается один раз: перешлите её получателю сейчас. Потеряли — /newlink Имя. "
+            "Статусы: /links").strip()
 
 
 # ---------- входящая очередь: защита от потери событий ----------
 def inbox_store(updates: list[dict], marker: Optional[int]) -> list[int]:
-    """Сохраняет обновления и новый marker ОДНОЙ транзакцией. Только после этого
-    marker считается подтверждённым: при падении до обработки события не теряются,
-    а будут обработаны при следующем старте (inbox_pending)."""
+    """Сохраняет обновления и новый marker ОДНОЙ транзакцией.
+
+    Перед записью убираем открытый токен из события bot_started и сохраняем его
+    SHA-256-хеш. При восстановлении из очереди хеша достаточно для поиска приглашения:
+    повторно раскрывать или хранить исходный токен в SQLite не требуется.
+    """
     c = _conn()
     ids: list[int] = []
-    with c:                                              # транзакция: всё или ничего
-        for u in updates:
-            cur = c.execute("INSERT INTO inbox (ts, payload) VALUES (?, ?)",
-                            (time.time(), json.dumps(u, ensure_ascii=False)))
+    with c:                                              # транзакция: очередь и marker фиксируются вместе
+        for update in updates:
+            # Не меняем исходный объект: он ещё используется текущей обработкой в памяти.
+            stored_update = update
+            raw_token = update.get("payload") if update.get("update_type") == "bot_started" else None
+            if isinstance(raw_token, str) and raw_token:
+                stored_update = dict(update)
+                stored_update.pop("payload", None)
+                stored_update["_stored_payload_hash"] = hash_token(raw_token)
+
+            cur = c.execute(
+                "INSERT INTO inbox (ts, payload) VALUES (?, ?)",
+                (time.time(), json.dumps(stored_update, ensure_ascii=False)),
+            )
             ids.append(int(cur.lastrowid))
         if marker is not None:
             c.execute("INSERT INTO settings (key, value) VALUES ('polling_marker', ?) "
@@ -580,7 +617,32 @@ def inbox_store(updates: list[dict], marker: Optional[int]) -> list[int]:
 
 
 def inbox_done(inbox_id: int) -> None:
-    db("UPDATE inbox SET done = 1 WHERE id = ?", (inbox_id,))
+    """Помечает событие выполненным и удаляет использованный токен из очереди.
+
+    Новые события сохраняют в inbox только хеш токена. Эта очистка нужна для старых
+    записей очереди, где payload ещё мог содержать открытый токен.
+    Очищаем поле только у bot_started, чтобы не затронуть другие типы обновлений MAX.
+    """
+    payload_clean = None
+    rows = q("SELECT payload FROM inbox WHERE id = ?", (inbox_id,))
+    if rows:
+        try:
+            update = json.loads(rows[0][0])
+            # Открытый токен нужен только до завершения обработки bot_started.
+            if (isinstance(update, dict)
+                    and update.get("update_type") == "bot_started"
+                    and isinstance(update.get("payload"), str)
+                    and update["payload"]):
+                update["payload"] = "***"
+                payload_clean = json.dumps(update, ensure_ascii=False)
+        except (TypeError, ValueError):
+            # Повреждённый JSON всё равно помечаем выполненным, не пытаясь его переписать.
+            pass
+
+    if payload_clean is None:
+        db("UPDATE inbox SET done = 1 WHERE id = ?", (inbox_id,))
+    else:
+        db("UPDATE inbox SET done = 1, payload = ? WHERE id = ?", (payload_clean, inbox_id))
 
 
 def inbox_pending() -> list[tuple[int, dict]]:
@@ -1230,7 +1292,13 @@ async def handle_recipient_request(client: httpx.AsyncClient, user_id: int, text
 # =====================================================================
 # 8. КОМАНДЫ ВЛАДЕЛЬЦА
 # =====================================================================
-async def handle_invite_start(client: httpx.AsyncClient, uid: int, token: str, name: str) -> None:
+async def handle_invite_start(
+    client: httpx.AsyncClient,
+    uid: int,
+    token: str,
+    name: str,
+    token_digest: Optional[str] = None,
+) -> None:
     """Пользователь открыл персональную ссылку (bot_started с payload)."""
     now = time.time()
     db("DELETE FROM link_attempts WHERE ts < ?", (now - 86400,))
@@ -1244,7 +1312,10 @@ async def handle_invite_start(client: httpx.AsyncClient, uid: int, token: str, n
     if is_recipient(uid):
         await send_text(client, uid, "Вы уже подключены и получаете результаты.")
         return
-    row = q("SELECT id, name, status, expires_ts, user_id FROM invites WHERE token_hash = ?", (hash_token(token),))
+    # При повторной обработке из inbox используем сохранённый хеш; при обычном событии
+    # хешируем токен, который пришёл от MAX и существует только в оперативной памяти.
+    digest = token_digest or hash_token(token)
+    row = q("SELECT id, name, status, expires_ts, user_id FROM invites WHERE token_hash = ?", (digest,))
     inv = row[0] if row else None
     usable = inv is not None and (inv[2] == "ожидает" or (inv[2] == "ждёт подтверждения" and inv[4] == uid))
     if not usable:
@@ -1259,32 +1330,129 @@ async def handle_invite_start(client: httpx.AsyncClient, uid: int, token: str, n
         db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
         await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
         return
-    db("UPDATE invites SET status = 'ждёт подтверждения', user_id = ? WHERE id = ?", (uid, inv_id))
+    # В одной транзакции активируем выбранное приглашение и отзываем остальные
+    # ожидающие приглашения этого же пользователя. Иначе один user_id мог бы
+    # получить несколько имён на подтверждение, а ответ «да» выбирал бы запись случайно.
+    with _conn() as c:
+        if status == "ожидает":
+            updated = c.execute(
+                "UPDATE invites SET status = 'ждёт подтверждения', user_id = ? "
+                "WHERE id = ? AND status = 'ожидает' AND expires_ts >= ?",
+                (uid, inv_id, now),
+            ).rowcount
+        else:
+            updated = c.execute(
+                "UPDATE invites SET status = 'ждёт подтверждения', user_id = ? "
+                "WHERE id = ? AND status = 'ждёт подтверждения' AND user_id = ? AND expires_ts >= ?",
+                (uid, inv_id, uid, now),
+            ).rowcount
+        revoked = 0
+        if updated == 1:
+            revoked = c.execute(
+                "UPDATE invites SET status = 'отозвана' "
+                "WHERE user_id = ? AND id <> ? AND status = 'ждёт подтверждения'",
+                (uid, inv_id),
+            ).rowcount
+
+    if updated != 1:
+        # Дополнительная проверка защищает от изменения приглашения другим процессом.
+        current = q("SELECT status, expires_ts FROM invites WHERE id = ?", (inv_id,))
+        if current and current[0][1] < time.time():
+            db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
+            await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
+        else:
+            await send_text(client, uid, "Ссылка уже использована, отозвана или занята. "
+                                         "Попросите отправителя прислать новую.")
+        return
+
+    if revoked:
+        log.info("для user_id=%s отозвано прежних незавершённых приглашений: %d", uid, revoked)
     log.info("ссылка открыта: приглашение #%s, user_id=%s", inv_id, uid)
-    await send_text(client, uid, f"Здравствуйте! Вас приглашают получать результаты работы бота. "
-                                 f"Вы — {inv_name}? Ответьте «да», чтобы подтвердить.")
+
+    # Если прежнее приглашение было заменено, объясняем это пользователю до вопроса об имени.
+    prefix = "Предыдущее незавершённое приглашение заменено новым. " if revoked else ""
+    await send_text(client, uid, prefix +
+                    f"Здравствуйте! Вас приглашают получать результаты работы бота. "
+                    f"Вы — {inv_name}? Ответьте «да», чтобы подтвердить.")
 
 
 async def handle_invite_reply(client: httpx.AsyncClient, uid: int, text: str) -> bool:
-    """Ответ пользователя на вопрос «Вы — <имя>?». True, если сообщение относится к приглашению."""
-    row = q("SELECT id, name, expires_ts FROM invites WHERE user_id = ? AND status = 'ждёт подтверждения'", (uid,))
-    if not row:
+    """Обрабатывает ответ на подтверждение имени.
+
+    Перевод приглашения в подключённое состояние, создание получателя и отметка
+    Start выполняются одной транзакцией. При сбое SQLite не останется состояния,
+    в котором приглашение уже подключено, а запись получателя ещё не создана.
+    """
+    rows = q(
+        "SELECT id, name, expires_ts FROM invites "
+        "WHERE user_id = ? AND status = 'ждёт подтверждения' ORDER BY id DESC",
+        (uid,),
+    )
+    if not rows:
         return False
-    inv_id, name, expires = row[0]
+
+    # Защита от неоднозначных старых записей, созданных до правила «одно приглашение на ID».
+    if len(rows) > 1:
+        with _conn() as c:
+            c.execute(
+                "UPDATE invites SET status = 'отозвана' "
+                "WHERE user_id = ? AND status = 'ждёт подтверждения'",
+                (uid,),
+            )
+        log.warning("у user_id=%s найдено несколько ожидающих приглашений; все отозваны", uid)
+        await send_text(client, uid, "Найдено несколько незавершённых приглашений. "
+                                     "Попросите владельца создать для вас новую ссылку.")
+        await alert_owner(f"У пользователя ID {uid} обнаружено несколько незавершённых приглашений. "
+                          "Они отозваны; при необходимости создайте новую ссылку.",
+                          key=f"multiple_invites:{uid}", every=3600.0)
+        return True
+
+    inv_id, name, expires = rows[0]
     now = time.time()
     if expires < now:
+        # Истёкшее приглашение нельзя подтвердить, даже если его статус ещё не обновлён.
         db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
         await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
         return True
+
     if text.strip().lower() != "да":
+        # Любой ответ, кроме «да», оставляет приглашение ожидающим подтверждения.
         await send_text(client, uid, f"Чтобы подтвердить, что вы — {name}, ответьте «да».")
         return True
-    db("UPDATE invites SET status = 'подключён', used_ts = ? WHERE id = ?", (now, inv_id))
-    db("INSERT OR IGNORE INTO recipients (user_id, name, active) VALUES (?, ?, 1)", (uid, name))
-    mark_started(uid)
+
+    # Повторно проверяем владельца приглашения, статус и срок прямо в UPDATE:
+    # это не позволяет подтвердить уже отозванную или использованную ссылку.
+    with _conn() as c:
+        updated = c.execute(
+            "UPDATE invites SET status = 'подключён', used_ts = ? "
+            "WHERE id = ? AND user_id = ? AND status = 'ждёт подтверждения' AND expires_ts >= ?",
+            (now, inv_id, uid, now),
+        ).rowcount
+        if updated == 1:
+            c.execute(
+                "INSERT OR IGNORE INTO recipients (user_id, name, active) VALUES (?, ?, 1)",
+                (uid, name),
+            )
+            c.execute(
+                "INSERT OR REPLACE INTO started (user_id, ts) VALUES (?, ?)",
+                (uid, now),
+            )
+
+    if updated != 1:
+        # Если состояние изменилось параллельно, отказываем в подключении по старой ссылке.
+        current = q("SELECT status, expires_ts FROM invites WHERE id = ?", (inv_id,))
+        if current and current[0][1] < time.time():
+            db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
+            await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
+        else:
+            await send_text(client, uid, "Приглашение уже использовано, отозвано или заменено. "
+                                         "Попросите владельца создать новую ссылку.")
+        return True
+
     log.info("получатель подключён по приглашению #%s: user_id=%s", inv_id, uid)
     await send_text(client, uid, "Готово, вы подключены: будете получать результаты.")
-    await alert_owner(f"{name} (ID {uid}) подключился(ась) по ссылке.", key=f"linked:{inv_id}", every=60.0)
+    await alert_owner(f"{name} (ID {uid}) подключился(ась) по ссылке.",
+                      key=f"linked:{inv_id}", every=60.0)
     return True
 
 
@@ -1336,7 +1504,11 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
         elif find_recipient(arg):
             await reply(f"{arg} уже подключён(а). Новая ссылка нужна до подключения; чтобы заменить "
                         "получателя, сначала /remove.")
+        elif not CFG.bot_name:
+            # Не отзываем действующую ссылку, пока нельзя сформировать новую.
+            await reply(make_links([arg]))
         else:
+            # Сначала проверили MAX_BOT_NAME, теперь безопасно отзываем старое приглашение.
             n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
                    "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
             log.info("перевыпуск ссылки: %s, отозвано старых: %s", arg, n)
@@ -1585,11 +1757,21 @@ async def process(update: dict, client: httpx.AsyncClient, replayed: bool = Fals
     в seen (процесс упал до освобождения), поэтому проверку дубликата для него пропускаем."""
     if update.get("update_type") == "bot_started":
         uid = (update.get("user") or {}).get("user_id")
+        # В обычном событии токен приходит в payload; восстановленная запись inbox
+        # вместо него содержит только внутреннее поле с SHA-256-хешем.
         payload = (update.get("payload") or "").strip()
+        stored_hash = (update.get("_stored_payload_hash") or "").strip()
+        has_invite = bool(payload or stored_hash)
         log.info("bot_started: user_id=%s (chat_id=%s)%s", uid, update.get("chat_id"),
-                 " по ссылке-приглашению" if payload else "")
-        if uid is not None and payload and uid != CFG.owner_id:
-            await handle_invite_start(client, uid, payload, display_name(update.get("user")))
+                 " по ссылке-приглашению" if has_invite else "")
+        if uid is not None and has_invite and uid != CFG.owner_id:
+            await handle_invite_start(
+                client,
+                uid,
+                payload,
+                display_name(update.get("user")),
+                token_digest=stored_hash or None,
+            )
             return
         if uid is not None:
             first = not has_started(uid)

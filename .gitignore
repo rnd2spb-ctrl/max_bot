@@ -5,3 +5,7 @@ venv/
 .venv/
 *.db
 *.sqlite3
+ai_studio_code.py
+openrouter_image.py
+numes_proc_image.py
+numes_cli.py
