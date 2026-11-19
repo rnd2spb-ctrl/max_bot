@@ -334,8 +334,7 @@ API = "https://platform-api2.max.ru"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 AI_TIMEOUT = 60           # таймаут запроса к нейросети, секунды
-AI_ATTEMPTS = 3           # всего попыток распознавания
-AI_MAX_WAIT = 60.0        # дольше этого паузу не ждём (например, суточный лимит исчерпан)
+AI_RETRY_PAUSES = (2.0, 3.0, 5.0, 8.0)   # паузы перед повтором: 429, 5xx, сеть, таймаут
 MSG_LIMIT = 4000          # лимит длины одного сообщения MAX
 BACKOFF_MAX = 60.0        # потолок паузы при ошибках опроса, секунды
 SHUTDOWN_GRACE = 30.0     # сколько ждать фоновые задачи при остановке, секунды
@@ -455,10 +454,6 @@ def load_marker() -> Optional[int]:
     return int(v) if v else None
 
 
-def save_marker(marker: int) -> None:
-    set_setting("polling_marker", str(marker))
-
-
 def get_prompt() -> str:
     return get_setting("prompt") or DEFAULT_PROMPT
 
@@ -520,10 +515,6 @@ def create_invite(name: str) -> str:
 
 
 def invite_link(token: str) -> str:
-    """Формирует полную персональную ссылку; без имени бота ссылка недопустима."""
-    # Защитная проверка нужна и здесь: функцию могут вызвать в обход make_links().
-    if not CFG.bot_name:
-        raise ConfigError("Не задан MAX_BOT_NAME: персональную ссылку сформировать нельзя.")
     return f"https://max.ru/{CFG.bot_name}?start={token}"
 
 
@@ -541,19 +532,11 @@ def invite_view(status: str, expires_ts: float, user_id: Optional[int]) -> str:
 
 
 def name_busy(name: str) -> Optional[str]:
-    """Возвращает причину занятости имени или None.
-
-    Сравнение lower() выполняется зарегистрированной в init_db() функцией Python,
-    поэтому одинаковые русские имена с разным регистром считаются одним именем.
-    Просроченные приглашения не блокируют повторное создание ссылки.
-    """
+    """Причина, по которой имя занято, или None."""
     if q("SELECT 1 FROM recipients WHERE lower(name) = lower(?)", (name,)):
         return "уже подключён(а) как получатель"
-
-    # Приглашение считается занятым только пока оно не отозвано и ещё действует.
-    if q("SELECT 1 FROM invites WHERE lower(name) = lower(?) "
-         "AND status IN ('ожидает', 'ждёт подтверждения') AND expires_ts >= ?",
-         (name, time.time())):
+    if q("SELECT 1 FROM invites WHERE lower(name) = lower(?) AND status IN ('ожидает', 'ждёт подтверждения')",
+         (name,)):
         return "уже есть неиспользованная ссылка (чтобы заменить: /newlink имя)"
     return None
 
@@ -587,28 +570,15 @@ def make_links(names: list[str]) -> str:
 
 # ---------- входящая очередь: защита от потери событий ----------
 def inbox_store(updates: list[dict], marker: Optional[int]) -> list[int]:
-    """Сохраняет обновления и новый marker ОДНОЙ транзакцией.
-
-    Перед записью убираем открытый токен из события bot_started и сохраняем его
-    SHA-256-хеш. При восстановлении из очереди хеша достаточно для поиска приглашения:
-    повторно раскрывать или хранить исходный токен в SQLite не требуется.
-    """
+    """Сохраняет обновления и новый marker ОДНОЙ транзакцией. Только после этого
+    marker считается подтверждённым: при падении до обработки события не теряются,
+    а будут обработаны при следующем старте (inbox_pending)."""
     c = _conn()
     ids: list[int] = []
-    with c:                                              # транзакция: очередь и marker фиксируются вместе
-        for update in updates:
-            # Не меняем исходный объект: он ещё используется текущей обработкой в памяти.
-            stored_update = update
-            raw_token = update.get("payload") if update.get("update_type") == "bot_started" else None
-            if isinstance(raw_token, str) and raw_token:
-                stored_update = dict(update)
-                stored_update.pop("payload", None)
-                stored_update["_stored_payload_hash"] = hash_token(raw_token)
-
-            cur = c.execute(
-                "INSERT INTO inbox (ts, payload) VALUES (?, ?)",
-                (time.time(), json.dumps(stored_update, ensure_ascii=False)),
-            )
+    with c:                                              # транзакция: всё или ничего
+        for u in updates:
+            cur = c.execute("INSERT INTO inbox (ts, payload) VALUES (?, ?)",
+                            (time.time(), json.dumps(u, ensure_ascii=False)))
             ids.append(int(cur.lastrowid))
         if marker is not None:
             c.execute("INSERT INTO settings (key, value) VALUES ('polling_marker', ?) "
@@ -617,32 +587,22 @@ def inbox_store(updates: list[dict], marker: Optional[int]) -> list[int]:
 
 
 def inbox_done(inbox_id: int) -> None:
-    """Помечает событие выполненным и удаляет использованный токен из очереди.
-
-    Новые события сохраняют в inbox только хеш токена. Эта очистка нужна для старых
-    записей очереди, где payload ещё мог содержать открытый токен.
-    Очищаем поле только у bot_started, чтобы не затронуть другие типы обновлений MAX.
-    """
-    payload_clean = None
+    """Помечает обновление обработанным. Токен ссылки-приглашения (поле payload у bot_started)
+    после обработки затирается, чтобы он не лежал в базе открытым текстом."""
+    payload = None
     rows = q("SELECT payload FROM inbox WHERE id = ?", (inbox_id,))
     if rows:
         try:
-            update = json.loads(rows[0][0])
-            # Открытый токен нужен только до завершения обработки bot_started.
-            if (isinstance(update, dict)
-                    and update.get("update_type") == "bot_started"
-                    and isinstance(update.get("payload"), str)
-                    and update["payload"]):
-                update["payload"] = "***"
-                payload_clean = json.dumps(update, ensure_ascii=False)
-        except (TypeError, ValueError):
-            # Повреждённый JSON всё равно помечаем выполненным, не пытаясь его переписать.
+            u = json.loads(rows[0][0])
+            if isinstance(u, dict) and u.get("payload"):
+                u["payload"] = "***"
+                payload = json.dumps(u, ensure_ascii=False)
+        except ValueError:
             pass
-
-    if payload_clean is None:
+    if payload is None:
         db("UPDATE inbox SET done = 1 WHERE id = ?", (inbox_id,))
     else:
-        db("UPDATE inbox SET done = 1, payload = ? WHERE id = ?", (payload_clean, inbox_id))
+        db("UPDATE inbox SET done = 1, payload = ? WHERE id = ?", (payload, inbox_id))
 
 
 def inbox_pending() -> list[tuple[int, dict]]:
@@ -896,7 +856,7 @@ async def download_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, st
 
 
 # =====================================================================
-# 6. КЛИЕНТ НЕЙРОСЕТИ (OpenRouter) И ЛИМИТЫ
+# 6. КЛИЕНТ НЕЙРОСЕТИ (OpenRouter)
 # =====================================================================
 class AIError(Exception):
     """Распознавание не удалось (после повторов или без смысла повторять).
@@ -907,88 +867,6 @@ class AIError(Exception):
     def __init__(self, msg: str, kind: str = "other"):
         super().__init__(msg)
         self.kind = kind
-
-
-@dataclass
-class RateLimitInfo:
-    limit: Optional[int] = None
-    remaining: Optional[int] = None
-    reset_ts: Optional[float] = None        # unix-время сброса, секунды
-    retry_after: Optional[float] = None     # секунд до повтора
-
-
-_last_rate: Optional[RateLimitInfo] = None
-
-
-def parse_reset(value: Any) -> Optional[float]:
-    """X-RateLimit-Reset: миллисекунды или секунды unix-времени.
-    Если значение больше 1_000_000_000_000, это миллисекунды (делим на 1000)."""
-    try:
-        v = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    if v <= 0:
-        return None
-    return v / 1000.0 if v > 1_000_000_000_000 else v
-
-
-def _to_int(v: Any) -> Optional[int]:
-    try:
-        return int(float(str(v).strip()))
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_rate_limits(headers: Mapping[str, str], body: Any = None) -> RateLimitInfo:
-    """Лимиты из заголовков ответа (приоритет) и из error.metadata.headers тела ответа.
-    Имена заголовков регистронезависимы."""
-    merged: dict[str, str] = {}
-    meta = ((body.get("error") or {}).get("metadata") or {}).get("headers") if isinstance(body, dict) \
-        and isinstance(body.get("error"), dict) else None
-    if isinstance(meta, dict):
-        merged.update({str(k).lower(): str(v) for k, v in meta.items()})
-    merged.update({k.lower(): v for k, v in headers.items()})    # заголовки главнее
-    info = RateLimitInfo(
-        limit=_to_int(merged.get("x-ratelimit-limit")),
-        remaining=_to_int(merged.get("x-ratelimit-remaining")),
-        reset_ts=parse_reset(merged["x-ratelimit-reset"]) if "x-ratelimit-reset" in merged else None,
-    )
-    if "retry-after" in merged:
-        info.retry_after = parse_retry_after(merged["retry-after"])
-    return info
-
-
-def format_duration(seconds: float) -> str:
-    s = max(0, int(seconds))
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h:
-        return f"{h} ч {m:02d} мин"
-    if m:
-        return f"{m} мин {sec:02d} с"
-    return f"{sec} с"
-
-
-def format_reset(reset_ts: float, now: Optional[float] = None) -> str:
-    """«сброс 17.11.2026 00:00:00 UTC / 17.11.2026 03:00:00 МСК, осталось 8 ч 30 мин»."""
-    now = time.time() if now is None else now
-    utc = datetime.fromtimestamp(reset_ts, timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
-    msk = datetime.fromtimestamp(reset_ts, MSK).strftime("%d.%m.%Y %H:%M:%S МСК")
-    left = reset_ts - now
-    tail = f"осталось {format_duration(left)}" if left > 0 else "срок сброса уже наступил"
-    return f"сброс {utc} / {msk}, {tail}"
-
-
-def describe_limits(info: RateLimitInfo) -> str:
-    parts = []
-    if info.limit is not None or info.remaining is not None:
-        parts.append(f"осталось запросов: {info.remaining if info.remaining is not None else '?'}"
-                     f" из {info.limit if info.limit is not None else '?'}")
-    if info.reset_ts is not None:
-        parts.append(format_reset(info.reset_ts))
-    if info.retry_after is not None:
-        parts.append(f"Retry-After {info.retry_after:.0f} с")
-    return "; ".join(parts) or "заголовков лимитов нет"
 
 
 def build_ai_payload(prompt: str, data: bytes, fmt: str) -> dict:
@@ -1030,75 +908,63 @@ def _error_text(body: Any, r: httpx.Response) -> str:
     return (r.text or "")[:300]
 
 
+_ai_sem: Optional[asyncio.Semaphore] = None   # создаётся при первом запросе
+
+
 async def recognize(client: httpx.AsyncClient, data: bytes, fmt: str) -> str:
     """Отправляет картинку в OpenRouter и возвращает текст ответа.
 
-    Повторы (всего AI_ATTEMPTS): HTTP 408/429/5xx, сеть, таймаут, пустой ответ.
-    При 429 пауза берётся из Retry-After, иначе из X-RateLimit-Reset, иначе 5·2^n с;
-    если ждать нужно дольше AI_MAX_WAIT (лимит исчерпан до завтра), повтор не делается.
-    Остальные 4xx (400/401/402/403) повторять бессмысленно. Итог ошибки: AIError."""
-    global _last_rate
+    Запросы идут строго по одному (семафор _ai_sem): картинки распознаются в порядке поступления.
+    Повторы после ошибок 429, 408, 5xx, сети, таймаута и пустого ответа: паузы AI_RETRY_PAUSES
+    (2, 3, 5, 8 с), всего пять запросов. Остальные 4xx (400/401/402/403/404) не повторяются.
+    Итог неудачи: AIError с видом ошибки (kind), по нему owner выбирает текст владельцу."""
+    global _ai_sem
     if not CFG.openrouter_api_key or not CFG.openrouter_model:
         raise AIError("OpenRouter не настроен (OPENROUTER_API_KEY / OPENROUTER_MODEL)")
+    if _ai_sem is None:
+        _ai_sem = asyncio.Semaphore(1)
     payload = build_ai_payload(get_prompt(), data, fmt)
+    attempts = len(AI_RETRY_PAUSES) + 1
     last_err = "нет ответа"
     last_kind = "other"
-    for attempt in range(1, AI_ATTEMPTS + 1):
-        pause = 5.0 * 2 ** (attempt - 1)
-        last_kind = "other"
-        try:
-            r = await client.post(OPENROUTER_URL, headers=ai_headers(), json=payload, timeout=AI_TIMEOUT)
-        except httpx.HTTPError as e:
-            last_err = f"сеть/таймаут: {e!r}"
-            log.warning("OpenRouter, попытка %d/%d: %s", attempt, AI_ATTEMPTS, last_err)
-        else:
-            body = _safe_json(r)
-            info = parse_rate_limits(r.headers, body)
-            if info.limit is not None or info.remaining is not None or info.reset_ts is not None:
-                _last_rate = info
-                log.info("лимиты OpenRouter: %s", describe_limits(info))
-                if info.remaining is not None and info.remaining <= 0:
-                    await alert_owner("Предупреждение: у модели закончились лимиты запросов OpenRouter ("
-                                      + describe_limits(info) + "). Изображения могут не обрабатываться.",
-                                      key="limit_zero", every=3600.0)
-            err_in_body = isinstance(body, dict) and isinstance(body.get("error"), dict) and not body.get("choices")
-            status = r.status_code
-            if err_in_body and status == 200:                      # ошибка внутри HTTP 200
-                status = _to_int(body["error"].get("code")) or 502
-            if status == 200:
-                try:
-                    text = (body["choices"][0]["message"]["content"] or "").strip()
-                except (KeyError, IndexError, TypeError):
-                    text = ""
-                if text:
-                    return text
-                last_err = "пустой или неожиданный ответ нейросети"
-                log.warning("OpenRouter, попытка %d/%d: %s", attempt, AI_ATTEMPTS, last_err)
-            elif status == 429 or status == 408 or status >= 500:
-                last_err = f"HTTP {status}: {_error_text(body, r)}"
-                last_kind = "limit" if status == 429 else "other"
-                if status == 429:
-                    _last_rate = info
-                    wait = info.retry_after
-                    if wait is None and info.reset_ts is not None:
-                        wait = info.reset_ts - time.time() + 1.0
-                    wait = pause if wait is None else max(1.0, wait)
-                    log.warning("OpenRouter 429 (%s): %s", describe_limits(info), last_err)
-                    if wait > AI_MAX_WAIT:
-                        raise AIError(f"лимит исчерпан, ждать {format_duration(wait)} (> {AI_MAX_WAIT:.0f} с): {last_err}",
-                                      kind="limit")
-                    pause = wait
-                else:
-                    log.warning("OpenRouter, попытка %d/%d: %s", attempt, AI_ATTEMPTS, last_err)
+    async with _ai_sem:
+        for attempt in range(1, attempts + 1):
+            last_kind = "other"
+            try:
+                r = await client.post(OPENROUTER_URL, headers=ai_headers(), json=payload, timeout=AI_TIMEOUT)
+            except httpx.HTTPError as e:
+                last_err = f"сеть/таймаут: {e!r}"
+                log.warning("OpenRouter, попытка %d/%d: %s", attempt, attempts, last_err)
             else:
-                hint = {401: " (проверьте OPENROUTER_API_KEY)", 402: " (недостаточно кредитов)",
-                        403: " (доступ запрещён или модерация)", 404: " (проверьте OPENROUTER_MODEL)"}.get(status, "")
-                kind = {401: "auth", 402: "credits", 403: "auth", 404: "model"}.get(status, "other")
-                raise AIError(f"HTTP {status}{hint}: {_error_text(body, r)}", kind=kind)
-        if attempt < AI_ATTEMPTS:
-            log.info("OpenRouter: пауза %.1f с перед повтором", pause)
-            await _sleep(pause)
-    raise AIError(f"после {AI_ATTEMPTS} попыток: {last_err}", kind=last_kind)
+                body = _safe_json(r)
+                status = r.status_code
+                err_in_body = isinstance(body, dict) and isinstance(body.get("error"), dict) and not body.get("choices")
+                if err_in_body and status == 200:                  # ошибка внутри HTTP 200
+                    code = body["error"].get("code")
+                    status = int(code) if str(code).isdigit() else 502
+                if status == 200:
+                    try:
+                        text = (body["choices"][0]["message"]["content"] or "").strip()
+                    except (KeyError, IndexError, TypeError):
+                        text = ""
+                    if text:
+                        return text
+                    last_err = "пустой или неожиданный ответ нейросети"
+                    log.warning("OpenRouter, попытка %d/%d: %s", attempt, attempts, last_err)
+                elif status == 429 or status == 408 or status >= 500:
+                    last_err = f"HTTP {status}: {_error_text(body, r)}"
+                    last_kind = "limit" if status == 429 else "other"
+                    log.warning("OpenRouter, попытка %d/%d: %s", attempt, attempts, last_err)
+                else:
+                    hint = {401: " (проверьте OPENROUTER_API_KEY)", 402: " (недостаточно кредитов)",
+                            403: " (доступ запрещён или модерация)", 404: " (проверьте OPENROUTER_MODEL)"}.get(status, "")
+                    kind = {401: "auth", 402: "credits", 403: "auth", 404: "model"}.get(status, "other")
+                    raise AIError(f"HTTP {status}{hint}: {_error_text(body, r)}", kind=kind)
+            if attempt < attempts:
+                pause = AI_RETRY_PAUSES[attempt - 1]
+                log.info("OpenRouter: пауза %.0f с перед повтором", pause)
+                await _sleep(pause)
+    raise AIError(f"после {attempts} попыток: {last_err}", kind=last_kind)
 
 
 async def check_model_vision(client: httpx.AsyncClient) -> None:
@@ -1151,11 +1017,6 @@ def find_recipient(text: str) -> Optional[tuple[int, str]]:
     else:
         rows = q("SELECT user_id, name FROM recipients WHERE lower(name) = lower(?)", (text,))
     return rows[0] if rows else None
-
-
-def parse_add(arg: str) -> Optional[tuple[str, int]]:
-    m = re.fullmatch(r"(.+?)\s+(\d+)", arg.strip())
-    return (m.group(1).strip(), int(m.group(2))) if m else None
 
 
 def split_title_body(result: str) -> tuple[str, str]:
@@ -1292,13 +1153,7 @@ async def handle_recipient_request(client: httpx.AsyncClient, user_id: int, text
 # =====================================================================
 # 8. КОМАНДЫ ВЛАДЕЛЬЦА
 # =====================================================================
-async def handle_invite_start(
-    client: httpx.AsyncClient,
-    uid: int,
-    token: str,
-    name: str,
-    token_digest: Optional[str] = None,
-) -> None:
+async def handle_invite_start(client: httpx.AsyncClient, uid: int, token: str, name: str) -> None:
     """Пользователь открыл персональную ссылку (bot_started с payload)."""
     now = time.time()
     db("DELETE FROM link_attempts WHERE ts < ?", (now - 86400,))
@@ -1312,10 +1167,7 @@ async def handle_invite_start(
     if is_recipient(uid):
         await send_text(client, uid, "Вы уже подключены и получаете результаты.")
         return
-    # При повторной обработке из inbox используем сохранённый хеш; при обычном событии
-    # хешируем токен, который пришёл от MAX и существует только в оперативной памяти.
-    digest = token_digest or hash_token(token)
-    row = q("SELECT id, name, status, expires_ts, user_id FROM invites WHERE token_hash = ?", (digest,))
+    row = q("SELECT id, name, status, expires_ts, user_id FROM invites WHERE token_hash = ?", (hash_token(token),))
     inv = row[0] if row else None
     usable = inv is not None and (inv[2] == "ожидает" or (inv[2] == "ждёт подтверждения" and inv[4] == uid))
     if not usable:
@@ -1330,129 +1182,32 @@ async def handle_invite_start(
         db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
         await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
         return
-    # В одной транзакции активируем выбранное приглашение и отзываем остальные
-    # ожидающие приглашения этого же пользователя. Иначе один user_id мог бы
-    # получить несколько имён на подтверждение, а ответ «да» выбирал бы запись случайно.
-    with _conn() as c:
-        if status == "ожидает":
-            updated = c.execute(
-                "UPDATE invites SET status = 'ждёт подтверждения', user_id = ? "
-                "WHERE id = ? AND status = 'ожидает' AND expires_ts >= ?",
-                (uid, inv_id, now),
-            ).rowcount
-        else:
-            updated = c.execute(
-                "UPDATE invites SET status = 'ждёт подтверждения', user_id = ? "
-                "WHERE id = ? AND status = 'ждёт подтверждения' AND user_id = ? AND expires_ts >= ?",
-                (uid, inv_id, uid, now),
-            ).rowcount
-        revoked = 0
-        if updated == 1:
-            revoked = c.execute(
-                "UPDATE invites SET status = 'отозвана' "
-                "WHERE user_id = ? AND id <> ? AND status = 'ждёт подтверждения'",
-                (uid, inv_id),
-            ).rowcount
-
-    if updated != 1:
-        # Дополнительная проверка защищает от изменения приглашения другим процессом.
-        current = q("SELECT status, expires_ts FROM invites WHERE id = ?", (inv_id,))
-        if current and current[0][1] < time.time():
-            db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
-            await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
-        else:
-            await send_text(client, uid, "Ссылка уже использована, отозвана или занята. "
-                                         "Попросите отправителя прислать новую.")
-        return
-
-    if revoked:
-        log.info("для user_id=%s отозвано прежних незавершённых приглашений: %d", uid, revoked)
+    db("UPDATE invites SET status = 'ждёт подтверждения', user_id = ? WHERE id = ?", (uid, inv_id))
     log.info("ссылка открыта: приглашение #%s, user_id=%s", inv_id, uid)
-
-    # Если прежнее приглашение было заменено, объясняем это пользователю до вопроса об имени.
-    prefix = "Предыдущее незавершённое приглашение заменено новым. " if revoked else ""
-    await send_text(client, uid, prefix +
-                    f"Здравствуйте! Вас приглашают получать результаты работы бота. "
-                    f"Вы — {inv_name}? Ответьте «да», чтобы подтвердить.")
+    await send_text(client, uid, f"Здравствуйте! Вас приглашают получать результаты работы бота. "
+                                 f"Вы — {inv_name}? Ответьте «да», чтобы подтвердить.")
 
 
 async def handle_invite_reply(client: httpx.AsyncClient, uid: int, text: str) -> bool:
-    """Обрабатывает ответ на подтверждение имени.
-
-    Перевод приглашения в подключённое состояние, создание получателя и отметка
-    Start выполняются одной транзакцией. При сбое SQLite не останется состояния,
-    в котором приглашение уже подключено, а запись получателя ещё не создана.
-    """
-    rows = q(
-        "SELECT id, name, expires_ts FROM invites "
-        "WHERE user_id = ? AND status = 'ждёт подтверждения' ORDER BY id DESC",
-        (uid,),
-    )
-    if not rows:
+    """Ответ пользователя на вопрос «Вы — <имя>?». True, если сообщение относится к приглашению."""
+    row = q("SELECT id, name, expires_ts FROM invites WHERE user_id = ? AND status = 'ждёт подтверждения'", (uid,))
+    if not row:
         return False
-
-    # Защита от неоднозначных старых записей, созданных до правила «одно приглашение на ID».
-    if len(rows) > 1:
-        with _conn() as c:
-            c.execute(
-                "UPDATE invites SET status = 'отозвана' "
-                "WHERE user_id = ? AND status = 'ждёт подтверждения'",
-                (uid,),
-            )
-        log.warning("у user_id=%s найдено несколько ожидающих приглашений; все отозваны", uid)
-        await send_text(client, uid, "Найдено несколько незавершённых приглашений. "
-                                     "Попросите владельца создать для вас новую ссылку.")
-        await alert_owner(f"У пользователя ID {uid} обнаружено несколько незавершённых приглашений. "
-                          "Они отозваны; при необходимости создайте новую ссылку.",
-                          key=f"multiple_invites:{uid}", every=3600.0)
-        return True
-
-    inv_id, name, expires = rows[0]
+    inv_id, name, expires = row[0]
     now = time.time()
     if expires < now:
-        # Истёкшее приглашение нельзя подтвердить, даже если его статус ещё не обновлён.
         db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
         await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
         return True
-
     if text.strip().lower() != "да":
-        # Любой ответ, кроме «да», оставляет приглашение ожидающим подтверждения.
         await send_text(client, uid, f"Чтобы подтвердить, что вы — {name}, ответьте «да».")
         return True
-
-    # Повторно проверяем владельца приглашения, статус и срок прямо в UPDATE:
-    # это не позволяет подтвердить уже отозванную или использованную ссылку.
-    with _conn() as c:
-        updated = c.execute(
-            "UPDATE invites SET status = 'подключён', used_ts = ? "
-            "WHERE id = ? AND user_id = ? AND status = 'ждёт подтверждения' AND expires_ts >= ?",
-            (now, inv_id, uid, now),
-        ).rowcount
-        if updated == 1:
-            c.execute(
-                "INSERT OR IGNORE INTO recipients (user_id, name, active) VALUES (?, ?, 1)",
-                (uid, name),
-            )
-            c.execute(
-                "INSERT OR REPLACE INTO started (user_id, ts) VALUES (?, ?)",
-                (uid, now),
-            )
-
-    if updated != 1:
-        # Если состояние изменилось параллельно, отказываем в подключении по старой ссылке.
-        current = q("SELECT status, expires_ts FROM invites WHERE id = ?", (inv_id,))
-        if current and current[0][1] < time.time():
-            db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
-            await send_text(client, uid, "Срок ссылки истёк. Попросите отправителя прислать новую.")
-        else:
-            await send_text(client, uid, "Приглашение уже использовано, отозвано или заменено. "
-                                         "Попросите владельца создать новую ссылку.")
-        return True
-
+    db("UPDATE invites SET status = 'подключён', used_ts = ? WHERE id = ?", (now, inv_id))
+    db("INSERT OR IGNORE INTO recipients (user_id, name, active) VALUES (?, ?, 1)", (uid, name))
+    mark_started(uid)
     log.info("получатель подключён по приглашению #%s: user_id=%s", inv_id, uid)
     await send_text(client, uid, "Готово, вы подключены: будете получать результаты.")
-    await alert_owner(f"{name} (ID {uid}) подключился(ась) по ссылке.",
-                      key=f"linked:{inv_id}", every=60.0)
+    await alert_owner(f"{name} (ID {uid}) подключился(ась) по ссылке.", key=f"linked:{inv_id}", every=60.0)
     return True
 
 
@@ -1504,11 +1259,7 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
         elif find_recipient(arg):
             await reply(f"{arg} уже подключён(а). Новая ссылка нужна до подключения; чтобы заменить "
                         "получателя, сначала /remove.")
-        elif not CFG.bot_name:
-            # Не отзываем действующую ссылку, пока нельзя сформировать новую.
-            await reply(make_links([arg]))
         else:
-            # Сначала проверили MAX_BOT_NAME, теперь безопасно отзываем старое приглашение.
             n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
                    "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
             log.info("перевыпуск ссылки: %s, отозвано старых: %s", arg, n)
@@ -1581,8 +1332,6 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
         last_s = f"{last[0][0]}. {fmt_ts(last[0][1])} — {last[0][2]} [{last[0][3]}]" if last else "нет"
         lines = [f"Получателей: {n_rec}", f"Записей в архиве: {n_arc}", f"Последний результат: {last_s}",
                  f"Модель: {CFG.openrouter_model}"]
-        if _last_rate:
-            lines.append("Лимиты OpenRouter: " + describe_limits(_last_rate))
         await reply("\n".join(lines))
     else:
         await reply("Неизвестная команда. /help — список команд.")
@@ -1661,7 +1410,7 @@ async def setup_wizard(client: httpx.AsyncClient, uid: int, text: str) -> None:
 def ai_error_text(e: Exception) -> str:
     """Сообщение владельцу об ошибке распознавания: суть и причина (секреты замаскированы)."""
     head = {
-        "limit": "Лимиты модели исчерпаны, изображение не обработано. Пришлите его после сброса лимита.",
+        "limit": "Нейросеть отвечает 429 (слишком много запросов): пять попыток не помогли. Картинку можно прислать позже.",
         "credits": "На счёте OpenRouter недостаточно кредитов, изображение не обработано.",
         "auth": "OpenRouter не принял ключ или доступ запрещён, изображение не обработано.",
         "model": "Модель OpenRouter не найдена или недоступна, изображение не обработано.",
@@ -1757,21 +1506,11 @@ async def process(update: dict, client: httpx.AsyncClient, replayed: bool = Fals
     в seen (процесс упал до освобождения), поэтому проверку дубликата для него пропускаем."""
     if update.get("update_type") == "bot_started":
         uid = (update.get("user") or {}).get("user_id")
-        # В обычном событии токен приходит в payload; восстановленная запись inbox
-        # вместо него содержит только внутреннее поле с SHA-256-хешем.
         payload = (update.get("payload") or "").strip()
-        stored_hash = (update.get("_stored_payload_hash") or "").strip()
-        has_invite = bool(payload or stored_hash)
         log.info("bot_started: user_id=%s (chat_id=%s)%s", uid, update.get("chat_id"),
-                 " по ссылке-приглашению" if has_invite else "")
-        if uid is not None and has_invite and uid != CFG.owner_id:
-            await handle_invite_start(
-                client,
-                uid,
-                payload,
-                display_name(update.get("user")),
-                token_digest=stored_hash or None,
-            )
+                 " по ссылке-приглашению" if payload else "")
+        if uid is not None and payload and uid != CFG.owner_id:
+            await handle_invite_start(client, uid, payload, display_name(update.get("user")))
             return
         if uid is not None:
             first = not has_started(uid)
