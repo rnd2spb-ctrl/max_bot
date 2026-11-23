@@ -11,22 +11,29 @@ from . import base
 from .ai import AIError, ai_error_text, recognize
 from .base import DEFAULT_PROMPT, MSG, compose_text, fmt_ts, log, redact, split_title_body
 from .max_api import ImageError, download_image
-from .people import active_recipients, deliver, deliver_image, delivery_summary, find_recipient, invite_view, parse_names, send_links
-from .storage import archive_add, archive_delivered, archive_rows, db, del_setting, filter_rows, get_prompt, get_setting, image_hash, image_known, image_store, purge_archive, q, set_setting
+from .people import (
+    active_recipients, delivery_summary, dispatch_archive, find_recipient,
+    invite_view, parse_names_with_org, send_links,
+)
+from .storage import (
+    archive_add, archive_rows, db, del_setting, filter_rows, get_prompt, get_setting,
+    image_hash, image_known, image_store, purge_archive, q, recipients_for_org, set_setting,
+)
 from .transport import answer_callback, send_message, send_text
 
 
 HELP = """/recipients — список получателей
-/add [имя] — создать персональные ссылки (одно или несколько имён, каждое с новой строки)
+/add [имя] [код] — создать ссылки (одно или несколько имён, каждое с новой строки)
 /links — статусы ссылок
-/newlink [имя] — перевыпустить ссылки (одно или несколько имён, каждое с новой строки)
+/newlink [имя] [код] — перевыпустить ссылки (одно или несколько имён, каждое с новой строки)
+Код после имени: 1 — Озон, 2 — WB, 3 — обе организации (по умолчанию).
 /revoke [имя] — отозвать неиспользованную ссылку
 /remove [имя или ID] — удалить получателя
 /pause [имя или ID] — временно не слать получателю
 /resume [имя или ID] — снова слать получателю
 /archive [N] — последние N записей (по умолчанию 10)
 /archive find [слово или дата] — поиск в архиве
-/resend [номер] [получатель или все] — повторная отправка
+/resend [номер] [получатель или все] [текст|картинка] — продолжить рассылку; формат обязателен, если ещё не выбран
 /prompt — показать промпт
 /prompt set [текст] — заменить промпт
 /status — состояние
@@ -45,13 +52,16 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
     if cmd == "/help":
         await reply(HELP)
     elif cmd == "/recipients":
-        rows = q("SELECT user_id, name, active FROM recipients ORDER BY name")
-        await reply("\n".join(f"{n} — {u} — {'активен' if a else 'отключён'}" for u, n, a in rows)
-                    or "Получателей нет.")
+        rows = q("SELECT user_id, name, active, org FROM recipients ORDER BY name")
+        labels = {1: "Озон", 2: "WB", 3: "Озон и WB"}
+        await reply("\n".join(
+            f"{n} — {u} — {'активен' if a else 'отключён'} — {labels.get(o, o)}"
+            for u, n, a, o in rows
+        ) or "Получателей нет.")
     elif cmd == "/add":
-        names = parse_names(arg)
+        names = parse_names_with_org(arg)
         if not names:
-            await reply("Формат: /add Имя. Несколько имён — каждое с новой строки.")
+            await reply("Формат: /add Имя [код]. Код после имени: 1 — Озон, 2 — WB, 3 — обе.")
         else:
             await send_links(client, owner_id, names)
     elif cmd == "/links":
@@ -59,11 +69,11 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
         await reply("\n".join(f"{n} — {invite_view(s, e, u)}" for n, s, e, u in rows)
                     or "Ссылок ещё не создавали. Создать: /add Имя.")
     elif cmd == "/newlink":
-        names = parse_names(arg)
+        names = parse_names_with_org(arg)
         if not names:
-            await reply("Формат: /newlink Имя. Несколько имён — каждое с новой строки.")
+            await reply("Формат: /newlink Имя [код]. Несколько имён — каждое с новой строки.")
         else:
-            for name in names:
+            for name, _org in names:
                 n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
                        "AND status IN ('ожидает', 'ждёт подтверждения')", (name,)).rowcount
                 if n:
@@ -93,24 +103,62 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
             rows = rows[: int(arg) if arg.isdigit() else 10]
         await reply("\n".join(f"{r[0]}. {fmt_ts(r[1])} — {r[2]} [{r[4]}]" for r in rows) or "Записей нет.")
     elif cmd == "/resend":
-        m = re.fullmatch(r"(\d+)\s+(.+)", arg)
-        rows = q("SELECT id, ts, title, text, status FROM archive WHERE id = ?", (int(m.group(1)),)) if m else []
+        m = re.fullmatch(r"(\d+)\s+(.+?)(?:\s+(текст|картинка))?", arg, flags=re.IGNORECASE)
+        rows = q(
+            "SELECT id, ts, title, text, status, org FROM archive WHERE id = ?",
+            (int(m.group(1)),),
+        ) if m else []
         row = rows[0] if rows else None
         if not m or not row or row[4] != "успех":
-            await reply("Формат: /resend [номер] [получатель или все]. Запись должна существовать и быть успешной.")
+            await reply(
+                "Формат: /resend [номер] [получатель или все] [текст|картинка]. "
+                "Запись должна существовать и быть успешной."
+            )
             return
-        if m.group(2).strip().lower() == "все":
-            targets = active_recipients()
+
+        recipient_arg = m.group(2).strip()
+        requested_kind = (
+            {"текст": "text", "картинка": "image"}.get((m.group(3) or "").lower())
+        )
+        dispatch_rows = q(
+            "SELECT kind FROM archive_dispatch WHERE archive_id = ?",
+            (row[0],),
+        )
+        stored_kind = dispatch_rows[0][0] if dispatch_rows else None
+        if stored_kind in ("text", "image"):
+            if requested_kind is not None and requested_kind != stored_kind:
+                chosen = "текст" if stored_kind == "text" else "картинка"
+                await reply(f"Формат уже выбран: {chosen}. Для этого материала другой формат выбрать нельзя.")
+                return
+            selected_kind = stored_kind
         else:
-            rec = find_recipient(m.group(2))
+            if requested_kind is None:
+                await reply(
+                    f"Для этой записи формат ещё не выбран. Укажите: "
+                    f"/resend {row[0]} все текст или /resend {row[0]} все картинка."
+                )
+                return
+            selected_kind = requested_kind
+
+        if recipient_arg.lower() == "все":
+            targets = recipients_for_org(int(row[5]))
+        else:
+            rec = find_recipient(recipient_arg)
             targets = [rec] if rec else []
         if not targets:
-            await reply("Получатель не найден.")
+            await reply("Получатель не найден или нет активных получателей для организации этой записи.")
             return
-        set_setting("pending", json.dumps({"type": "resend", "archive_id": row[0],
-                                           "targets": [list(t) for t in targets]}))
-        await reply(f"Отправить повторно №{row[0]} «{row[2]}» → "
-                    f"{', '.join(t[1] for t in targets)}? Ответьте «да».")
+        set_setting("pending", json.dumps({
+            "type": "resend",
+            "archive_id": row[0],
+            "kind": selected_kind,
+            "targets": [list(t) for t in targets],
+        }))
+        kind_label = "текст" if selected_kind == "text" else "картинка"
+        await reply(
+            f"Отправить повторно №{row[0]} «{row[2]}» ({kind_label}) → "
+            f"{', '.join(t[1] for t in targets)}? Ответьте «да»."
+        )
     elif cmd in ("/pause", "/resume"):
         rec = find_recipient(arg)
         if not rec:
@@ -145,18 +193,69 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
 async def execute_pending(client: httpx.AsyncClient, owner_id: int, p: dict) -> None:
     if p["type"] == "remove":
         db("DELETE FROM recipients WHERE user_id = ?", (p["user_id"],))
+        db(
+            "DELETE FROM dispatch_recipients WHERE recipient_id = ? AND status != 'ok'",
+            (p["user_id"],),
+        )
         await send_text(client, owner_id, "Получатель удалён.")
     elif p["type"] == "set_prompt":
         set_setting("prompt", p["text"])
         await send_text(client, owner_id, "Промпт заменён.")
     elif p["type"] == "resend":
-        rows = q("SELECT ts, title, text FROM archive WHERE id = ?", (p["archive_id"],))
+        rows = q(
+            "SELECT buttons_expires_ts FROM archive WHERE id = ?",
+            (p["archive_id"],)
+        )
         if not rows:
             await send_text(client, owner_id, "Запись уже удалена из архива.")
             return
+        expires_ts = rows[0][0]
         recs = [(t[0], t[1]) for t in p["targets"]]
-        ok, failed = await deliver(client, p["archive_id"], rows[0][0], compose_text(rows[0][1], rows[0][2]), recs)
-        await send_text(client, owner_id, delivery_summary(ok, len(recs), failed))
+        result = await dispatch_archive(
+            client, p["archive_id"], p["kind"], recs, expires_ts,
+            allow_expired=True, extend_recipients=True,
+        )
+        await send_text(client, owner_id, dispatch_result_text(result, "Повторная отправка"))
+
+
+def dispatch_result_text(result: dict, prefix: str = "Рассылка") -> str:
+    """Понятный итог для callback и /resend."""
+    state = result.get("state")
+    kind = result.get("kind")
+    kind_text = "текст" if kind == "text" else "картинка" if kind == "image" else "материал"
+    if state == "busy":
+        return "Рассылка этого материала уже выполняется. Дождитесь её завершения."
+    if state == "wrong_kind":
+        chosen = "текст" if kind == "text" else "картинка"
+        return f"Формат уже выбран: {chosen}. Для этого материала другой формат выбрать нельзя."
+    if state == "legacy_unknown":
+        return ("Эта запись была разослана старой версией бота, которая не сохраняла выбранный формат. "
+                "Чтобы не допустить повторную или смешанную рассылку, автоматический повтор для неё заблокирован.")
+    if state == "expired":
+        return "Срок действия кнопок истёк. Для повторной отправки используйте /resend."
+    if state == "completed":
+        return "Все выбранные получатели уже получили этот материал."
+    if state == "no_recipients":
+        return MSG["no_recipients"]
+    if state == "no_active_recipients":
+        return ("Среди недоставленных адресатов нет активных получателей, подходящих для этой организации. "
+                "После включения получателя повторите /resend.")
+    if state == "no_pending_targets":
+        return "Для выбранного получателя нет недоставленного материала."
+    if state == "missing":
+        return "Материал уже удалён из архива."
+    if state == "lease_lost":
+        return "Не удалось продолжить рассылку: истекла блокировка. Повторите нажатие."
+    if state == "upload_failed":
+        return ("Не удалось загрузить изображение в MAX. В этой попытке отправка получателям не запускалась; "
+                "ранее подтверждённые доставки сохранены. Повторите ту же кнопку или используйте /resend.")
+    ok = int(result.get("ok", 0))
+    total = int(result.get("total", 0))
+    failed = result.get("failed", [])
+    suffix = delivery_summary(ok, total, failed)
+    if state == "completed":
+        suffix = f"Отправлено: {ok} из {total}."
+    return f"{prefix} ({kind_text}). {suffix}"
 
 
 # =====================================================================
@@ -167,8 +266,9 @@ def wizard_question(step: str) -> str:
         return ("Шаг 1 из 3: промпт для нейросети. Ответьте «да», чтобы принять стандартный "
                 "(посмотреть: /prompt), или пришлите свой текст.")
     if step == "recipients":
-        return ("Шаг 2 из 3: получатели. Присылайте имена (по одному или списком, каждое с новой строки): "
-                "для каждого создам персональную ссылку. Перешлите её получателю: он откроет ссылку, "
+        return ("Шаг 2 из 3: получатели. Присылайте имена (по одному или списком, каждое с новой строки). "
+                "После имени можно указать код организации: 1 — Озон, 2 — WB, 3 — обе (по умолчанию). "
+                "Для каждого создам персональную ссылку. Перешлите её получателю: он откроет ссылку, "
                 "нажмёт Start и подтвердит своё имя. Когда закончите, напишите «готово».")
     return "Шаг 3 из 3: проверьте настройку. Ответьте «да» для завершения."
 
@@ -193,10 +293,14 @@ async def setup_wizard(client: httpx.AsyncClient, uid: int, text: str) -> None:
     elif step == "recipients":
         if text.lower() == "готово":
             set_setting("setup_step", "confirm")
-            recs = "\n".join(f"{n} — {u}" for u, n in active_recipients()) or "нет"
+            recipient_rows = q("SELECT user_id, name, org FROM recipients WHERE active = 1 ORDER BY name")
+            org_labels = {1: "Озон", 2: "WB", 3: "Озон и WB"}
+            recs = "\n".join(
+                f"{n} — {u} — {org_labels.get(o, o)}" for u, n, o in recipient_rows
+            ) or "нет"
             await say(f"Промпт:\n{get_prompt()[:300]}\n\nПолучатели:\n{recs}\n\n" + wizard_question("confirm"))
             return
-        names = parse_names(text)
+        names = parse_names_with_org(text)
         if not names:
             await say("Пришлите имя получателя или напишите «готово».")
         else:
@@ -210,7 +314,25 @@ async def setup_wizard(client: httpx.AsyncClient, uid: int, text: str) -> None:
             await say(wizard_question("confirm"))
 
 
+def parse_org_directive(text: str) -> tuple[int, bool]:
+    t = (text or "").strip().lower()
+    mapping = {"1": 1, "2": 2, "3": 3, "озон": 1, "wb": 2, "вб": 2, "все": 3}
+    if not t:
+        return 3, True
+    if t in mapping:
+        return mapping[t], True
+    return 3, False
+
+
 async def process_images(client: httpx.AsyncClient, uid: int, m: dict) -> None:
+    directive_text = m.get("text", "")
+    target_org, recognized = parse_org_directive(directive_text)
+    if directive_text.strip() and not recognized:
+        await send_text(
+            client, uid,
+            f"Подпись «{directive_text.strip()}» не распознана как код организации, "
+            "используется «обе» по умолчанию.",
+        )
     purge_archive()
     base.CFG.save_dir.mkdir(parents=True, exist_ok=True)
     received_at = time.time()
@@ -237,24 +359,33 @@ async def process_images(client: httpx.AsyncClient, uid: int, m: dict) -> None:
             result = await recognize(client, data, fmt)
         except (AIError, httpx.HTTPError, KeyError, IndexError, ValueError) as e:
             log.error("распознавание mid=%s не удалось: %s", m["mid"], redact(str(e)))
-            archive_add(received_at, "Ошибка распознавания", "", str(path), "ошибка")
+            archive_add(received_at, "Ошибка распознавания", "", str(path), "ошибка", org=target_org)
             await send_text(client, uid, ai_error_text(e))
             continue
         # заголовок записи архива — первая непустая строка ответа, тело — всё остальное
         title, body = split_title_body(result)
-        aid = archive_add(received_at, title, body, str(path), "успех")
+        buttons_expires_ts = time.time() + base.CFG.button_ttl_hours * 3600
+        aid = archive_add(
+            received_at, title, body, str(path), "успех",
+            buttons_expires_ts=buttons_expires_ts,
+            org=target_org,
+        )
         image_store(digest, received_at, aid)
         log.info("распознано: запись архива №%d, заголовок «%s», тело %d знаков", aid, title[:60], len(body))
-        if not active_recipients():
-            await send_text(client, uid, MSG["no_recipients"])
+        org_label = {1: "Озон", 2: "WB", 3: "Озон и WB"}[target_org]
+        if not recipients_for_org(target_org):
+            await send_text(client, uid, f"Нет активных получателей для организации «{org_label}».")
             continue
         await send_text(client, uid, compose_text(title, body))
         buttons = [[
             {"type": "callback", "text": "Текст", "payload": f"deliver:text:{aid}"},
             {"type": "callback", "text": "Картинка", "payload": f"deliver:image:{aid}"},
         ]]
-        await send_message(client, uid, "Что разослать получателям — распознанный текст или саму картинку?",
-                           attachments=[{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
+        await send_message(
+            client, uid,
+            f"Что разослать получателям ({org_label}) — распознанный текст или саму картинку?",
+            attachments=[{"type": "inline_keyboard", "payload": {"buttons": buttons}}],
+        )
 
 
 _user_locks: dict[int, asyncio.Lock] = {}
@@ -296,18 +427,24 @@ async def handle_owner(client: httpx.AsyncClient, uid: int, m: dict) -> None:
 # 15. НАЖАТИЕ INLINE-КНОПКИ («Текст» / «Картинка» после распознавания)
 # =====================================================================
 async def handle_callback(client: httpx.AsyncClient, update: dict) -> None:
-    """message_callback: владелец выбрал, что разослать получателям. В документации MAX
-    два места расходятся, где лежат callback_id/payload/user -- на верхнем уровне события
-    или внутри update["callback"], поэтому разбираем оба варианта."""
+    """Обрабатывает выбор формата; формат закрепляется за записью навсегда."""
     cb = update.get("callback") if isinstance(update.get("callback"), dict) else update
     callback_id = cb.get("callback_id") or update.get("callback_id")
     payload = cb.get("payload") if cb.get("payload") is not None else update.get("payload")
     user = cb.get("user") if isinstance(cb.get("user"), dict) else (update.get("user") or {})
     uid = user.get("user_id")
 
-    async def ans(text: Optional[str] = None) -> None:
+    async def ans(
+        text: Optional[str] = None,
+        attachments: Optional[list[dict]] = None,
+        remove_attachments: bool = True,
+    ) -> None:
         if callback_id:
-            await answer_callback(client, callback_id, text)
+            await answer_callback(
+                client, callback_id, text,
+                attachments=attachments,
+                remove_attachments=remove_attachments,
+            )
         elif text is not None and uid is not None:
             await send_text(client, uid, text)
 
@@ -319,24 +456,63 @@ async def handle_callback(client: httpx.AsyncClient, update: dict) -> None:
         log.warning("message_callback: неизвестный или устаревший payload %r", payload)
         await ans("Кнопка устарела.")
         return
+
     kind, aid = m.group(1), int(m.group(2))
-    if archive_delivered(aid):
-        await ans("Уже разослано ранее.")
-        return
-    rows = q("SELECT ts, title, text, image_path FROM archive WHERE id = ?", (aid,))
+    rows = q(
+        "SELECT ts, title, text, image_path, buttons_expires_ts, status, org "
+        "FROM archive WHERE id = ?",
+        (aid,)
+    )
     if not rows:
         await ans("Запись архива не найдена (возможно, уже удалена по сроку хранения).")
         return
-    ts, title, text, image_path = rows[0]
-    recs = active_recipients()
-    if not recs:
-        await ans(MSG["no_recipients"])
+    ts, title, body, image_path, expires_ts, archive_status, org = rows[0]
+    if archive_status != "успех":
+        await ans("Для этой записи рассылка недоступна: распознавание завершилось ошибкой.")
         return
-    if kind == "text":
-        ok, failed = await deliver(client, aid, ts, compose_text(title, text), recs)
-        chosen = "текст"
+    if expires_ts is None:
+        expires_ts = ts + base.CFG.button_ttl_hours * 3600
+    if expires_ts <= time.time():
+        await ans("Срок действия кнопок истёк. Для повторной отправки используйте /resend.")
+        return
+
+    recs = recipients_for_org(int(org))
+    result = await dispatch_archive(client, aid, kind, recs, expires_ts)
+    log.info("рассылка записи №%d: выбранный формат=%s, состояние=%s, доставлено=%s/%s",
+             aid, result.get("kind", kind), result.get("state"),
+             result.get("ok", 0), result.get("total", 0))
+    result_state = result.get("state")
+    selected_kind = result.get("kind")
+    if result_state in ("partial", "upload_failed", "wrong_kind", "lease_lost"):
+        if expires_ts <= time.time():
+            await ans(
+                "Рассылка осталась незавершённой, но срок действия кнопок истёк. "
+                "Продолжить её можно командой /resend.",
+                remove_attachments=True,
+            )
+            return
+        # Пока есть недоставленные получатели и кнопки ещё действуют,
+        # оставляем только кнопку выбранного формата.
+        button = None
+        if selected_kind in ("text", "image"):
+            button_text = "Текст" if selected_kind == "text" else "Картинка"
+            button = [[{
+                "type": "callback",
+                "text": button_text,
+                "payload": f"deliver:{selected_kind}:{aid}",
+            }]]
+        attachments = (
+            [{"type": "inline_keyboard", "payload": {"buttons": button}}]
+            if button else None
+        )
+        await ans(
+            dispatch_result_text(result),
+            attachments=attachments,
+            remove_attachments=False,
+        )
+    elif result_state in ("busy", "no_recipients"):
+        # Не пересоздаём клавиатуру: другая задача может ещё выполнять рассылку.
+        await ans(dispatch_result_text(result), remove_attachments=False)
     else:
-        ok, failed = await deliver_image(client, aid, image_path, recs)
-        chosen = "картинка"
-    log.info("рассылка записи №%d (%s) по кнопке: доставлено %d из %d", aid, chosen, ok, len(recs))
-    await ans(f"Разослано ({chosen}). {delivery_summary(ok, len(recs), failed)}")
+        # Полная доставка, истёкшая кнопка или несуществующая запись: убираем клавиатуру.
+        await ans(dispatch_result_text(result), remove_attachments=True)

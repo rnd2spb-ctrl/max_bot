@@ -119,6 +119,7 @@ class Config:
     log_keep_runs: int = 10
     bot_name: str = ""             # имя бота для ссылок https://max.ru/<имя>?start=...
     invite_ttl_hours: int = 72     # срок действия персональной ссылки
+    button_ttl_hours: int = 24     # срок действия кнопок рассылки
 
 
 def _int(env: Mapping[str, str], name: str, default: int, lo: int, hi: int) -> int:
@@ -173,6 +174,7 @@ def build_config(env: Mapping[str, str]) -> Config:
         log_keep_runs=_int(env, "LOG_KEEP_RUNS", 10, 1, 1000),
         bot_name=(env.get("MAX_BOT_NAME") or "").strip().lstrip("@"),
         invite_ttl_hours=_int(env, "INVITE_TTL_HOURS", 72, 1, 720),
+        button_ttl_hours=_int(env, "BUTTON_TTL_HOURS", 24, 1, 720),
     )
 
 

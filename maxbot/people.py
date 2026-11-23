@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import secrets
 import time
 from pathlib import Path
 from typing import Optional
 import httpx
 from . import base
-from .base import MSG, MSG_LIMIT, compose_text, fmt_ts, log, parse_date
-from .max_api import ImageUploadError, upload_image
-from .storage import archive_rows, db, filter_rows, q
+from .base import MSG, compose_text, fmt_ts, log, parse_date
+from .max_api import upload_image
+from .storage import (
+    archive_rows, claim_archive_dispatch, db, dispatch_recipients, filter_rows,
+    active_recipient_ids, finish_archive_dispatch, mark_dispatch_recipient_sending,
+    q, recipients_for_org, record_dispatch_delivery, touch_archive_dispatch,
+)
 from .transport import alert_owner, send_image, send_text
 
 
@@ -38,12 +43,15 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_invite(name: str) -> str:
-    """Создаёт одноразовую ссылку для имени и возвращает токен."""
-    token = secrets.token_urlsafe(16)                # 22 знака из A-Za-z0-9_-, с запасом до лимита 128
+def create_invite(name: str, org: int = 3) -> str:
+    """Создаёт одноразовую ссылку с кодом организации."""
+    if org not in (1, 2, 3):
+        raise ValueError("org должен быть 1, 2 или 3")
+    token = secrets.token_urlsafe(16)
     now = time.time()
-    db("INSERT INTO invites (name, token_hash, created_ts, expires_ts, status) VALUES (?, ?, ?, ?, 'ожидает')",
-       (name, hash_token(token), now, now + base.CFG.invite_ttl_hours * 3600))
+    db("INSERT INTO invites (name, token_hash, created_ts, expires_ts, status, org) "
+       "VALUES (?, ?, ?, ?, 'ожидает', ?)",
+       (name, hash_token(token), now, now + base.CFG.invite_ttl_hours * 3600, org))
     return token
 
 
@@ -79,7 +87,24 @@ def parse_names(text: str) -> list[str]:
     return [n.strip() for n in text.splitlines() if n.strip()]
 
 
-async def send_links(client: httpx.AsyncClient, uid: int, names: list[str]) -> None:
+def parse_names_with_org(text: str) -> list[tuple[str, int]]:
+    """Каждая строка — имя и необязательный последний код организации 1/2/3."""
+    out: list[tuple[str, int]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        head, _, tail = line.rpartition(" ")
+        if head and tail in ("1", "2", "3"):
+            out.append((head.strip(), int(tail)))
+        else:
+            out.append((line, 3))
+    return out
+
+
+async def send_links(
+    client: httpx.AsyncClient, uid: int, names: list[tuple[str, int]]
+) -> None:
     """Создаёт приглашения и одним отчётом показывает успешные ссылки и ошибки.
 
     Сырые токены не сохраняются в БД и попадают только в этот ответ владельцу.
@@ -90,9 +115,17 @@ async def send_links(client: httpx.AsyncClient, uid: int, names: list[str]) -> N
                         "MAX_BOT_NAME=имя_бота (имя из адреса https://max.ru/имя_бота) и перезапустите бота.")
         return
 
-    created: list[tuple[str, str]] = []
+    created: list[tuple[str, int, str]] = []
     failed: list[tuple[str, str]] = []
-    for name in names:
+    warnings: list[str] = []
+    org_labels = {1: "Озон", 2: "WB", 3: "Озон и WB"}
+    for name, org in names:
+        tail = name.rpartition(" ")[2]
+        if tail.isdigit() and tail not in ("1", "2", "3"):
+            warnings.append(
+                f"{name}: последний числовой фрагмент похож на ошибочный код; "
+                "имя сохранено целиком, назначены обе организации"
+            )
         if len(name) > 40:
             failed.append((name, "слишком длинное имя (до 40 знаков)"))
             continue
@@ -100,46 +133,40 @@ async def send_links(client: httpx.AsyncClient, uid: int, names: list[str]) -> N
         if busy:
             failed.append((name, busy))
             continue
-        link = invite_link(create_invite(name))
-        created.append((name, link))
+        link = invite_link(create_invite(name, org))
+        created.append((name, org, link))
 
-    # MAX не поддерживает таблицы как отдельный тип разметки. Используем
-    # компактные строки с колонками и Markdown-ссылками, которые остаются кликабельными.
-    header = "**Персональные ссылки**\n\n№ │ Имя │ Ссылка\n"
+    # Каждый получатель: жирные номер и имя, затем полная кликабельная ссылка
+    # на отдельной строке. Между получателями — пустая строка; шапки и разделителей нет.
     rows = []
-    for number, (name, link) in enumerate(created, 1):
-        safe_name = (name.replace("\\", "\\\\").replace("|", "\\|")
-                     .replace("*", "\\*").replace("_", "\\_").replace("`", "\\`"))
-        rows.append(f"{number} │ {safe_name} │ [{link}]({link})")
-    if created:
-        rows.append("")
-        rows.append(f"Создано ссылок: **{len(created)}**")
-        rows.append(f"Срок действия: {base.CFG.invite_ttl_hours} ч. Каждая ссылка одноразовая.")
-        rows.append("Перешлите ссылки соответствующим получателям. Потеряли ссылку — /newlink Имя.")
-        rows.append("Статусы приглашений — /links.")
+    for number, (name, org, link) in enumerate(created, 1):
+        safe_name = html.escape(name)
+        safe_link = html.escape(link, quote=True)
+        rows.append(
+            f"<b>{number:02d} {safe_name} — {org_labels[org]}</b>\n"
+            f'<a href="{safe_link}">{html.escape(link)}</a>'
+        )
+
+    if warnings:
+        if rows:
+            rows.append("")
+        rows.append("<b>Проверьте код организации:</b>")
+        rows.extend(f"• {html.escape(warning)}" for warning in warnings)
 
     if failed:
-        rows.extend(["", "**Не удалось создать ссылки:**"])
-        rows.extend(f"• {name}: {reason}" for name, reason in failed)
+        if rows:
+            rows.append("")
+        rows.append("<b>Не удалось создать ссылки:</b>")
+        rows.extend(
+            f"• {html.escape(name)}: {html.escape(reason)}"
+            for name, reason in failed
+        )
 
     if not rows:
         return
 
-    # Разбиваем отчёт только между строками, чтобы ссылки не обрезались.
-    chunks: list[str] = []
-    current = header
-    for row in rows:
-        candidate = current + row + "\n"
-        if len(candidate) > MSG_LIMIT - 100 and current != header:
-            chunks.append(current.rstrip())
-            current = header + row + "\n"
-        else:
-            current = candidate
-    if current.strip():
-        chunks.append(current.rstrip())
-
-    for chunk in chunks:
-        await send_text(client, uid, chunk, format="markdown")
+    # send_text разбивает длинный отчёт по абзацам; каждая запись короче лимита MAX.
+    await send_text(client, uid, "\n\n".join(rows), format="html")
 
 
 # =====================================================================
@@ -162,56 +189,145 @@ def find_recipient(text: str) -> Optional[tuple[int, str]]:
     return rows[0] if rows else None
 
 
-async def deliver(client: httpx.AsyncClient, archive_id: int, ts: float, text: str,
-                  recs: list[tuple[int, str]]) -> tuple[int, list[str]]:
-    """Отправляет результат получателям. Сбой одного не останавливает остальных.
+async def dispatch_archive(
+    client: httpx.AsyncClient,
+    archive_id: int,
+    kind: Optional[str],
+    recs: list[tuple[int, str]],
+    expires_ts: Optional[float],
+    *,
+    allow_expired: bool = False,
+    extend_recipients: bool = False,
+) -> dict:
+    """Запускает/продолжает рассылку, закрепляя исходный формат для archive_id.
 
-    Второй элемент результата — строки «Имя — причина» по недоставленным.
+    Получатели со статусом ok не отправляются повторно. Для изображения загрузка
+    выполняется один раз на попытку рассылки; ошибка загрузки не меняет статусы
+    отдельных получателей и позволяет повторить ту же кнопку.
     """
-    body = f"Результат от {fmt_ts(ts)}:\n{text}"
-    ok, failed = 0, []
-    for uid, name in recs:
-        status = await send_text(client, uid, body)
-        db("INSERT INTO deliveries (archive_id, recipient_id, status, ts) VALUES (?, ?, ?, ?)",
-           (archive_id, uid, "ok" if status == "ok" else "fail", time.time()))
-        if status == "ok":
-            ok += 1
-        elif status == "rejected" and not has_started(uid):
-            failed.append(name)
-            log.warning("не доставлено %s (%s): %s", name, uid, MSG["not_started"])
-        else:
-            failed.append(name)
-            log.warning("не доставлено %s (%s): %s", name, uid, MSG["send_failed"])
-    return ok, failed
+    claim = claim_archive_dispatch(
+        archive_id, kind, recs, expires_ts,
+        allow_expired=allow_expired,
+        extend_recipients=extend_recipients,
+        default_kind="text",
+    )
+    if claim["state"] != "claimed":
+        return claim
 
+    # claim_archive_dispatch может вернуть старые строки dispatch_recipients.
+    # Сверяем их с текущими активными получателями и актуальной организацией.
+    claimed_ids = [uid for uid, _, _ in claim["recipients"]]
+    eligible = active_recipient_ids(claimed_ids)
+    current_targets = {uid for uid, _ in recs}
+    eligible.intersection_update(current_targets)
 
-async def deliver_image(client: httpx.AsyncClient, archive_id: int, image_path: str,
-                        recs: list[tuple[int, str]]) -> tuple[int, list[str]]:
-    """Рассылает исходную картинку (кнопка «Картинка»): файл загружается в MAX один раз
-    (upload_image), затем получателям уходит ссылка на этот же загруженный файл. Если
-    загрузка не удалась (например, файл уже удалён по сроку хранения архива) -- все
-    получатели считаются недоставленными, в журнал пишется причина."""
-    ok, failed = 0, []
+    target_ids = {uid for uid, _ in recs} if extend_recipients else None
+
+    def scope_result(result: dict) -> dict:
+        """Для /resend показывает статистику только по явно выбранным адресатам."""
+        if target_ids is not None:
+            selected = [
+                row for row in dispatch_recipients(archive_id)
+                if row[0] in target_ids
+            ]
+            result["total"] = len(selected)
+            result["ok"] = sum(1 for row in selected if row[2] == "ok")
+            result["failed"] = [row[1] for row in selected if row[2] != "ok"]
+        result["kind"] = claim["kind"]
+        return result
+
+    lease_token = claim["lease_token"]
+    if not eligible:
+        result = finish_archive_dispatch(
+            archive_id, lease_token,
+            "Нет активных получателей, подходящих для этой организации",
+        )
+        return scope_result({
+            "state": "no_active_recipients",
+            "ok": result["ok"],
+            "total": result["total"],
+            "failed": result["failed"],
+        })
+    rows = q(
+        "SELECT ts, title, text, image_path FROM archive WHERE id = ?",
+        (archive_id,)
+    )
+    if not rows:
+        finish_archive_dispatch(archive_id, lease_token, "Материал удалён из архива")
+        return {"state": "missing"}
+
+    ts, title, body, image_path = rows[0]
+    image_payload = None
+    if claim["kind"] == "image":
+        if not touch_archive_dispatch(archive_id, lease_token):
+            return {"state": "lease_lost", "kind": claim["kind"]}
+        try:
+            image_payload = await upload_image(client, Path(image_path))
+        except Exception as e:
+            error = f"{type(e).__name__}: ошибка загрузки изображения"
+            log.error("не удалось загрузить картинку архива №%d (%s)", archive_id, type(e).__name__)
+            result = finish_archive_dispatch(archive_id, lease_token, error)
+            return scope_result({
+                "state": "upload_failed",
+                "error": error,
+                "ok": result["ok"],
+                "total": result["total"],
+                "failed": result["failed"],
+            })
+
     try:
-        image_payload = await upload_image(client, Path(image_path))
-    except (ImageUploadError, OSError) as e:
-        log.error("рассылка картинки записи №%d: загрузка не удалась: %s", archive_id, e)
-        for uid, name in recs:
-            db("INSERT INTO deliveries (archive_id, recipient_id, status, ts) VALUES (?, ?, ?, ?)",
-               (archive_id, uid, "fail", time.time()))
-            failed.append(name)
-        return 0, failed
-    for uid, name in recs:
-        status = await send_image(client, uid, image_payload)
-        db("INSERT INTO deliveries (archive_id, recipient_id, status, ts) VALUES (?, ?, ?, ?)",
-           (archive_id, uid, "ok" if status == "ok" else "fail", time.time()))
-        if status == "ok":
-            ok += 1
-        else:
-            failed.append(name)
-            log.warning("не доставлена картинка %s (%s): %s", name, uid,
-                       MSG["not_started"] if status == "rejected" and not has_started(uid) else MSG["send_failed"])
-    return ok, failed
+        for uid, name, _previous_status in claim["recipients"]:
+            if uid not in eligible:
+                log.info(
+                    "пропуск получателя %s (%s): удалён, приостановлен или больше не входит в организацию материала №%d",
+                    name, uid, archive_id,
+                )
+                continue
+            if not touch_archive_dispatch(archive_id, lease_token):
+                return {"state": "lease_lost", "kind": claim["kind"]}
+            # Повторная проверка непосредственно перед отправкой закрывает паузу/удаление,
+            # произошедшие уже после первоначальной проверки списка.
+            if uid not in active_recipient_ids([uid]):
+                continue
+            if not mark_dispatch_recipient_sending(archive_id, uid, lease_token):
+                continue
+
+            error = None
+            try:
+                if claim["kind"] == "text":
+                    message = f"Результат от {fmt_ts(ts)}:\n{compose_text(title, body)}"
+                    status = await send_text(client, uid, message)
+                else:
+                    status = await send_image(client, uid, image_payload)
+            except Exception as e:
+                status = "failed"
+                error = f"{type(e).__name__}: {e}"[:500]
+                log.exception("рассылка архива №%d получателю %s (%s) завершилась исключением",
+                              archive_id, name, uid)
+
+            if status != "ok" and error is None:
+                if status == "rejected" and not has_started(uid):
+                    error = MSG["not_started"]
+                else:
+                    error = MSG["send_failed"]
+            record_dispatch_delivery(
+                archive_id, uid, lease_token,
+                "ok" if status == "ok" else "fail", error
+            )
+            if status != "ok":
+                log.warning("не доставлено %s (%s), архив №%d: %s", name, uid, archive_id, error)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"[:500]
+        log.exception("ошибка в обработке рассылки архива №%d", archive_id)
+        try:
+            result = finish_archive_dispatch(archive_id, lease_token, error)
+        except RuntimeError:
+            return {"state": "lease_lost", "kind": claim["kind"]}
+        result["error"] = error
+        return scope_result(result)
+
+    result = finish_archive_dispatch(archive_id, lease_token)
+    return scope_result(result)
 
 
 def delivery_summary(ok: int, total: int, failed: list[str]) -> str:
@@ -300,10 +416,10 @@ async def handle_invite_start(client: httpx.AsyncClient, uid: int, token: str, n
 
 async def handle_invite_reply(client: httpx.AsyncClient, uid: int, text: str) -> bool:
     """Ответ пользователя на вопрос «Вы — <имя>?». True, если сообщение относится к приглашению."""
-    row = q("SELECT id, name, expires_ts FROM invites WHERE user_id = ? AND status = 'ждёт подтверждения'", (uid,))
+    row = q("SELECT id, name, expires_ts, org FROM invites WHERE user_id = ? AND status = 'ждёт подтверждения'", (uid,))
     if not row:
         return False
-    inv_id, name, expires = row[0]
+    inv_id, name, expires, org = row[0]
     now = time.time()
     if expires < now:
         db("UPDATE invites SET status = 'истекла' WHERE id = ?", (inv_id,))
@@ -313,7 +429,8 @@ async def handle_invite_reply(client: httpx.AsyncClient, uid: int, text: str) ->
         await send_text(client, uid, f"Чтобы подтвердить, что вы — {name}, ответьте «да».")
         return True
     db("UPDATE invites SET status = 'подключён', used_ts = ? WHERE id = ?", (now, inv_id))
-    db("INSERT OR IGNORE INTO recipients (user_id, name, active) VALUES (?, ?, 1)", (uid, name))
+    db("INSERT OR IGNORE INTO recipients (user_id, name, active, org) VALUES (?, ?, 1, ?)",
+       (uid, name, org))
     mark_started(uid)
     log.info("получатель подключён по приглашению #%s: user_id=%s", inv_id, uid)
     await send_text(client, uid, "Готово, вы подключены: будете получать результаты.")

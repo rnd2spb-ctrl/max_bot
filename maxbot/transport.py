@@ -103,13 +103,26 @@ async def send_image(client: httpx.AsyncClient, user_id: int, image_payload: dic
     return await _post_message(client, user_id, {"attachments": [{"type": "image", "payload": image_payload}]})
 
 
-async def answer_callback(client: httpx.AsyncClient, callback_id: str, text: Optional[str] = None) -> bool:
-    """Отвечает на нажатие inline-кнопки (POST /answers). message.attachments=[] убирает
-    клавиатуру из исходного сообщения, чтобы повторное нажатие было невозможно.
-    Не критично для доставки результата: сбой только пишется в журнал."""
-    body: dict = {"message": {"attachments": []}}
+async def answer_callback(
+    client: httpx.AsyncClient,
+    callback_id: str,
+    text: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
+    remove_attachments: bool = True,
+) -> bool:
+    """Отвечает на нажатие inline-кнопки (POST /answers).
+
+    attachments=None и remove_attachments=False сохраняют текущую клавиатуру.
+    Пустой список attachments удаляет все вложения исходного сообщения.
+    """
+    message: dict = {}
     if text is not None:
-        body["message"]["text"] = text[:MSG_LIMIT]
+        message["text"] = text[:MSG_LIMIT]
+    if attachments is not None:
+        message["attachments"] = attachments
+    elif remove_attachments:
+        message["attachments"] = []
+    body = {"message": message}
     try:
         r = await client.post(f"{API}/answers", params={"callback_id": callback_id},
                               headers={"Authorization": base.CFG.bot_token}, json=body, timeout=15)

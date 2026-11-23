@@ -15,7 +15,7 @@ from .base import BACKOFF_MAX, ConfigError, MSG, SHUTDOWN_GRACE, load_config, lo
 from .max_api import AuthError, TransientApiError, check_webhook, display_name, get_updates, parse_message
 from .owner import handle_callback, handle_owner
 from .people import active_recipients, find_recipient, first_time_stranger, handle_invite_reply, handle_invite_start, handle_recipient_request, has_started, is_recipient, mark_started
-from .storage import claim_mid, inbox_done, inbox_pending, inbox_store, init_db, load_marker, purge_archive, release_mid
+from .storage import claim_mid, inbox_done, inbox_pending, inbox_retry, inbox_store, init_db, load_marker, purge_archive, release_mid
 from .transport import alert_owner, send_text
 
 
@@ -101,23 +101,74 @@ async def process(update: dict, client: httpx.AsyncClient, replayed: bool = Fals
 _tasks: set[asyncio.Task] = set()
 
 
-def spawn(coro: Awaitable[None], inbox_id: Optional[int] = None) -> asyncio.Task:
-    """Фоновая задача на одно обновление. Ошибка задачи не роняет цикл опроса.
-    Запись входящей очереди помечается выполненной, только если задача дошла до конца
-    (при отмене или сбое она останется и будет обработана заново при следующем старте)."""
+def spawn(
+    coro: Awaitable[None],
+    inbox_id: Optional[int] = None,
+    *,
+    retry_update: Optional[dict] = None,
+    retry_client: Optional[httpx.AsyncClient] = None,
+    initial_delay: float = 0.0,
+) -> asyncio.Task:
+    """Фоновая задача обработки события.
+
+    Для callback используются ограниченные повторы с сохранённой задержкой.
+    Остальные типы событий сохраняют прежнюю политику: исключение журналируется,
+    владельцу отправляется уведомление, событие помечается выполненным.
+    """
     async def runner() -> None:
+        current = coro
         try:
-            await coro
+            if initial_delay > 0:
+                await asyncio.sleep(initial_delay)
         except asyncio.CancelledError:
+            close = getattr(current, "close", None)
+            if close:
+                close()
             raise
-        except Exception:
-            # Ошибка повторяется при каждом запуске, если не отметить запись выполненной.
-            # Поэтому обновление отмечаем обработанным и пишем в журнал, что оно отброшено.
-            log.exception("обновление отброшено из-за необработанной ошибки (inbox_id=%s)", inbox_id)
-            await alert_owner("Необработанная ошибка при обработке события, событие отброшено. "
-                              "Подробности в журнале.", key="task_err", every=300.0)
-        if inbox_id is not None:
-            inbox_done(inbox_id)
+
+        while True:
+            try:
+                await current
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if (inbox_id is not None and retry_update is not None
+                        and retry_client is not None):
+                    attempts, delay, exhausted = inbox_retry(
+                        inbox_id, f"{type(e).__name__}: {e}"
+                    )
+                    if not exhausted:
+                        log.exception(
+                            "обработка callback не удалась, повтор №%d через %.1f с (inbox_id=%s)",
+                            attempts, delay, inbox_id
+                        )
+                        await asyncio.sleep(delay)
+                        current = process(retry_update, retry_client, replayed=True)
+                        continue
+                    log.exception(
+                        "callback не обработан после %d попыток (inbox_id=%s)",
+                        attempts, inbox_id
+                    )
+                    await alert_owner(
+                        "Не удалось обработать нажатие кнопки после нескольких попыток. "
+                        "Состояние рассылки сохранено; нажмите ту же кнопку ещё раз или используйте /resend.",
+                        key=f"callback_err:{inbox_id}", every=300.0
+                    )
+                    inbox_done(inbox_id)
+                    return
+
+                log.exception("обновление отброшено из-за необработанной ошибки (inbox_id=%s)", inbox_id)
+                await alert_owner(
+                    "Необработанная ошибка при обработке события, событие отброшено. Подробности в журнале.",
+                    key="task_err", every=300.0
+                )
+                if inbox_id is not None:
+                    inbox_done(inbox_id)
+                return
+            else:
+                if inbox_id is not None:
+                    inbox_done(inbox_id)
+                return
     t = asyncio.create_task(runner())
     _tasks.add(t)
     t.add_done_callback(_tasks.discard)
@@ -136,8 +187,14 @@ def replay_inbox(client: httpx.AsyncClient) -> int:
     """При старте заново запускает обновления, сохранённые, но не обработанные
     (падение или остановка посреди обработки). Дубли отсекаются по mid."""
     pend = inbox_pending()
-    for iid, upd in pend:
-        spawn(process(upd, client, replayed=True), iid)
+    for iid, upd, delay in pend:
+        is_callback = upd.get("update_type") == "message_callback"
+        spawn(
+            process(upd, client, replayed=True), iid,
+            retry_update=upd if is_callback else None,
+            retry_client=client if is_callback else None,
+            initial_delay=delay,
+        )
     if pend:
         log.warning("восстановлено необработанных обновлений: %d", len(pend))
     return len(pend)
@@ -193,7 +250,12 @@ async def poll_loop(client: httpx.AsyncClient, max_polls: Optional[int] = None) 
         if new_marker is not None:
             marker = new_marker
         for upd, iid in zip(updates, ids):
-            spawn(process(upd, client), iid)
+            is_callback = upd.get("update_type") == "message_callback"
+            spawn(
+                process(upd, client), iid,
+                retry_update=upd if is_callback else None,
+                retry_client=client if is_callback else None,
+            )
         if updates:
             log.info("получено обновлений: %d, marker=%s", len(updates), marker)
         elif time.monotonic() - started < 0.2:       # сервер ответил мгновенно и пусто: не крутим CPU
