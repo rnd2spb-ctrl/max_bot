@@ -26,7 +26,11 @@ class AIError(Exception):
 
 
 def build_ai_payload(prompt: str, data: bytes, fmt: str) -> dict:
-    """Тело запроса /chat/completions: текст первым, затем картинка как data-URL (base64)."""
+    """Тело запроса /chat/completions: текст первым, затем картинка как data-URL (base64).
+
+    max_tokens задан явно (иначе провайдер может подставить маленький лимит по умолчанию).
+    reasoning.enabled=False: у моделей с режимом «рассуждений» без этого флага весь лимит
+    токенов может уйти на скрытые рассуждения, а видимый ответ придёт пустым или обрезанным."""
     mime = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[fmt]
     b64 = base64.b64encode(data).decode()
     return {
@@ -38,6 +42,9 @@ def build_ai_payload(prompt: str, data: bytes, fmt: str) -> dict:
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
             ],
         }],
+        "max_tokens": base.CFG.openrouter_max_tokens,
+        "reasoning": {"enabled": False},
+        "stream": False,
     }
 
 
@@ -100,10 +107,14 @@ async def recognize(client: httpx.AsyncClient, data: bytes, fmt: str) -> str:
                     status = int(code) if str(code).isdigit() else 502
                 if status == 200:
                     try:
-                        text = (body["choices"][0]["message"]["content"] or "").strip()
+                        choice = body["choices"][0]
+                        text = (choice["message"]["content"] or "").strip()
                     except (KeyError, IndexError, TypeError):
-                        text = ""
+                        text, choice = "", {}
                     if text:
+                        if choice.get("finish_reason") == "length":
+                            log.warning("OpenRouter: ответ обрезан по лимиту max_tokens=%d, "
+                                       "увеличьте OPENROUTER_MAX_TOKENS", base.CFG.openrouter_max_tokens)
                         return text
                     last_err = "пустой или неожиданный ответ нейросети"
                     log.warning("OpenRouter, попытка %d/%d: %s", attempt, attempts, last_err)

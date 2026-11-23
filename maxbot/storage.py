@@ -162,7 +162,7 @@ def archive_add(ts: float, title: str, text: str, image_path: str, status: str) 
                   (ts, title, text, image_path, status)).lastrowid)
 
 
-# ---------- картинки: сравнение по хешу SHA-256 (байты картинки в базе не хранятся) ----------
+# ---------- картинки: сравнение по хешу SHA-256 ----------
 def image_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -173,6 +173,13 @@ def image_known(digest: str) -> bool:
 
 def image_store(digest: str, ts: float, aid: int) -> None:
     db("INSERT OR IGNORE INTO images (hash, ts, archive_id) VALUES (?, ?, ?)", (digest, ts, aid))
+
+
+def archive_delivered(archive_id: int) -> bool:
+    """True, если по записи архива уже была хоть одна попытка рассылки (успешная или нет).
+    Защита от повторной рассылки при двойном нажатии кнопки или нажатии на старую кнопку
+    после перезапуска бота."""
+    return bool(q("SELECT 1 FROM deliveries WHERE archive_id = ? LIMIT 1", (archive_id,)))
 
 
 def archive_rows(recipient_id: Optional[int] = None) -> list[tuple]:
@@ -196,7 +203,7 @@ def filter_rows(rows: list[tuple], query: str) -> list[tuple]:
 
 def purge_archive() -> None:
     """Архив хранится ARCHIVE_DAYS дней: удаляем записи и файлы старше срока.
-    Заодно чистим выполненные записи входящей очереди, старые mid и старые хеши картинок."""
+    Заодно чистим выполненные записи входящей очереди и старые mid."""
     now = time.time()
     cutoff = now - base.CFG.archive_days * 86400
     for aid, path in q("SELECT id, image_path FROM archive WHERE ts < ?", (cutoff,)):

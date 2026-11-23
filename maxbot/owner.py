@@ -5,21 +5,21 @@ import asyncio
 import json
 import re
 import time
+from typing import Optional
 import httpx
 from . import base
 from .ai import AIError, ai_error_text, recognize
 from .base import DEFAULT_PROMPT, MSG, compose_text, fmt_ts, log, redact, split_title_body
 from .max_api import ImageError, download_image
-from .people import active_recipients, deliver, delivery_summary, find_recipient, invite_view, make_links, parse_names
-from .storage import (archive_add, archive_rows, db, del_setting, filter_rows, get_prompt, get_setting,
-                      image_hash, image_known, image_store, purge_archive, q, set_setting)
-from .transport import send_text
+from .people import active_recipients, deliver, deliver_image, delivery_summary, find_recipient, invite_view, parse_names, send_links
+from .storage import archive_add, archive_delivered, archive_rows, db, del_setting, filter_rows, get_prompt, get_setting, image_hash, image_known, image_store, purge_archive, q, set_setting
+from .transport import answer_callback, send_message, send_text
 
 
 HELP = """/recipients — список получателей
-/add [имя] — создать персональную ссылку (можно несколько имён, каждое с новой строки)
+/add [имя] — создать персональные ссылки (одно или несколько имён, каждое с новой строки)
 /links — статусы ссылок
-/newlink [имя] — заменить неиспользованную ссылку новой
+/newlink [имя] — перевыпустить ссылки (одно или несколько имён, каждое с новой строки)
 /revoke [имя] — отозвать неиспользованную ссылку
 /remove [имя или ID] — удалить получателя
 /pause [имя или ID] — временно не слать получателю
@@ -53,22 +53,22 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
         if not names:
             await reply("Формат: /add Имя. Несколько имён — каждое с новой строки.")
         else:
-            await reply(make_links(names))
+            await send_links(client, owner_id, names)
     elif cmd == "/links":
         rows = q("SELECT name, status, expires_ts, user_id FROM invites ORDER BY id DESC LIMIT 50")
         await reply("\n".join(f"{n} — {invite_view(s, e, u)}" for n, s, e, u in rows)
                     or "Ссылок ещё не создавали. Создать: /add Имя.")
     elif cmd == "/newlink":
-        if not arg:
-            await reply("Формат: /newlink Имя")
-        elif find_recipient(arg):
-            await reply(f"{arg} уже подключён(а). Новая ссылка нужна до подключения; чтобы заменить "
-                        "получателя, сначала /remove.")
+        names = parse_names(arg)
+        if not names:
+            await reply("Формат: /newlink Имя. Несколько имён — каждое с новой строки.")
         else:
-            n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
-                   "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
-            log.info("перевыпуск ссылки: %s, отозвано старых: %s", arg, n)
-            await reply(make_links([arg]))
+            for name in names:
+                n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
+                       "AND status IN ('ожидает', 'ждёт подтверждения')", (name,)).rowcount
+                if n:
+                    log.info("перевыпуск ссылки: %s, отозвано старых: %s", name, n)
+            await send_links(client, owner_id, names)
     elif cmd == "/revoke":
         n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
                "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
@@ -200,7 +200,8 @@ async def setup_wizard(client: httpx.AsyncClient, uid: int, text: str) -> None:
         if not names:
             await say("Пришлите имя получателя или напишите «готово».")
         else:
-            await say(make_links(names) + "\n\nПришлите следующее имя или напишите «готово».")
+            await send_links(client, uid, names)
+            await say("Пришлите следующее имя или напишите «готово».")
     else:  # confirm
         if text.lower() == "да":
             set_setting("setup_done", "1")
@@ -244,13 +245,16 @@ async def process_images(client: httpx.AsyncClient, uid: int, m: dict) -> None:
         aid = archive_add(received_at, title, body, str(path), "успех")
         image_store(digest, received_at, aid)
         log.info("распознано: запись архива №%d, заголовок «%s», тело %d знаков", aid, title[:60], len(body))
-        recs = active_recipients()
-        if not recs:
+        if not active_recipients():
             await send_text(client, uid, MSG["no_recipients"])
             continue
-        ok, failed = await deliver(client, aid, received_at, compose_text(title, body), recs)
-        log.info("рассылка записи №%d: доставлено %d из %d", aid, ok, len(recs))
-        await send_text(client, uid, delivery_summary(ok, len(recs), failed))
+        await send_text(client, uid, compose_text(title, body))
+        buttons = [[
+            {"type": "callback", "text": "Текст", "payload": f"deliver:text:{aid}"},
+            {"type": "callback", "text": "Картинка", "payload": f"deliver:image:{aid}"},
+        ]]
+        await send_message(client, uid, "Что разослать получателям — распознанный текст или саму картинку?",
+                           attachments=[{"type": "inline_keyboard", "payload": {"buttons": buttons}}])
 
 
 _user_locks: dict[int, asyncio.Lock] = {}
@@ -286,3 +290,53 @@ async def handle_owner(client: httpx.AsyncClient, uid: int, m: dict) -> None:
             await send_text(client, uid, MSG["need_image"])
             return
     await process_images(client, uid, m)             # 4. изображения (вне замка: ИИ долго, команды не ждут)
+
+
+# =====================================================================
+# 15. НАЖАТИЕ INLINE-КНОПКИ («Текст» / «Картинка» после распознавания)
+# =====================================================================
+async def handle_callback(client: httpx.AsyncClient, update: dict) -> None:
+    """message_callback: владелец выбрал, что разослать получателям. В документации MAX
+    два места расходятся, где лежат callback_id/payload/user -- на верхнем уровне события
+    или внутри update["callback"], поэтому разбираем оба варианта."""
+    cb = update.get("callback") if isinstance(update.get("callback"), dict) else update
+    callback_id = cb.get("callback_id") or update.get("callback_id")
+    payload = cb.get("payload") if cb.get("payload") is not None else update.get("payload")
+    user = cb.get("user") if isinstance(cb.get("user"), dict) else (update.get("user") or {})
+    uid = user.get("user_id")
+
+    async def ans(text: Optional[str] = None) -> None:
+        if callback_id:
+            await answer_callback(client, callback_id, text)
+        elif text is not None and uid is not None:
+            await send_text(client, uid, text)
+
+    if uid != base.CFG.owner_id:
+        log.info("message_callback от не-владельца user_id=%s, игнорирую", uid)
+        return
+    m = re.fullmatch(r"deliver:(text|image):(\d+)", (payload or "").strip())
+    if not m:
+        log.warning("message_callback: неизвестный или устаревший payload %r", payload)
+        await ans("Кнопка устарела.")
+        return
+    kind, aid = m.group(1), int(m.group(2))
+    if archive_delivered(aid):
+        await ans("Уже разослано ранее.")
+        return
+    rows = q("SELECT ts, title, text, image_path FROM archive WHERE id = ?", (aid,))
+    if not rows:
+        await ans("Запись архива не найдена (возможно, уже удалена по сроку хранения).")
+        return
+    ts, title, text, image_path = rows[0]
+    recs = active_recipients()
+    if not recs:
+        await ans(MSG["no_recipients"])
+        return
+    if kind == "text":
+        ok, failed = await deliver(client, aid, ts, compose_text(title, text), recs)
+        chosen = "текст"
+    else:
+        ok, failed = await deliver_image(client, aid, image_path, recs)
+        chosen = "картинка"
+    log.info("рассылка записи №%d (%s) по кнопке: доставлено %d из %d", aid, chosen, ok, len(recs))
+    await ans(f"Разослано ({chosen}). {delivery_summary(ok, len(recs), failed)}")

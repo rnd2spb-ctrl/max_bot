@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 from typing import Any, Optional
 import httpx
 from . import base, transport
@@ -92,6 +93,59 @@ async def download_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, st
 
 
 # =====================================================================
+# 5b. ЗАГРУЗКА КАРТИНКИ ДЛЯ ПОВТОРНОЙ ОТПРАВКИ (кнопка «Картинка»)
+# =====================================================================
+class ImageUploadError(Exception):
+    """Не удалось загрузить картинку в MAX для отправки получателям."""
+
+
+async def upload_image(client: httpx.AsyncClient, path: Path) -> dict:
+    """Загружает локальный файл в MAX (трёхшаговый POST /uploads) и возвращает
+    вложение-payload для последующей отправки через send_image().
+
+    Шаг 1: POST /uploads?type=image -> {url, ...}. Шаг 2: сам файл грузится на этот url.
+    Шаг 3: из ответа шага 2 берём token (или, если он вернулся в виде словаря «photos»,
+    весь этот словарь) -- официальная документация MAX на этот счёт неоднозначна, два
+    формата описаны в разных местах, поэтому разбираем оба. Поднимает ImageUploadError
+    при любой неудаче; вызывающий код сам решает, что делать (пометить доставку неудачной)."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        raise ImageUploadError(f"не удалось прочитать файл {path}: {e}") from e
+    try:
+        r1 = await client.post(f"{API}/uploads", params={"type": "image"},
+                               headers={"Authorization": base.CFG.bot_token}, timeout=30)
+    except httpx.HTTPError as e:
+        raise ImageUploadError(f"не удалось получить адрес загрузки (POST /uploads): {e!r}") from e
+    if r1.status_code != 200:
+        raise ImageUploadError(f"POST /uploads: HTTP {r1.status_code} {r1.text[:200]}")
+    try:
+        up1 = r1.json()
+    except ValueError as e:
+        raise ImageUploadError("POST /uploads: ответ не JSON") from e
+    upload_url = (up1 or {}).get("url")
+    if not upload_url:
+        raise ImageUploadError(f"POST /uploads: нет поля url в ответе: {up1}")
+    try:
+        r2 = await client.post(upload_url, files={"data": (path.name, data)}, timeout=60)
+    except httpx.HTTPError as e:
+        raise ImageUploadError(f"загрузка файла на {upload_url}: {e!r}") from e
+    if r2.status_code not in (200, 201):
+        raise ImageUploadError(f"загрузка файла: HTTP {r2.status_code} {r2.text[:200]}")
+    try:
+        up2 = r2.json()
+    except ValueError:
+        up2 = {}
+    token = (up2 or {}).get("token") or (up1 or {}).get("token")
+    photos = (up2 or {}).get("photos")
+    if isinstance(photos, dict) and photos:
+        return {"photos": photos}
+    if token:
+        return {"token": token}
+    raise ImageUploadError(f"не получен token для отправки картинки (ответ шага 1: {up1}, шага 2: {up2})")
+
+
+# =====================================================================
 # 12. LONG POLLING
 # =====================================================================
 class AuthError(Exception):
@@ -105,7 +159,10 @@ class TransientApiError(Exception):
 
 
 async def get_updates(client: httpx.AsyncClient, marker: Optional[int]) -> dict:
-    params: dict[str, Any] = {"limit": base.CFG.poll_limit, "timeout": base.CFG.poll_timeout, "types": POLL_TYPES}
+    # Фильтр types не передаём: в документации MAX не описано, как передаётся массив,
+    # и при неверном формате событие bot_started (Start по ссылке) до бота не доходит.
+    # Лишние типы событий bot.process() просто пропускает.
+    params: dict[str, Any] = {"limit": base.CFG.poll_limit, "timeout": base.CFG.poll_timeout}
     if marker is not None:
         params["marker"] = marker
     r = await client.get(f"{API}/updates", params=params,

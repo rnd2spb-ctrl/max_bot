@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Mapping, Optional
 from zoneinfo import ZoneInfo
 
+try:
+    # MAX и некоторые другие российские сервисы используют сертификат,
+    # выпущенный отечественным удостоверяющим центром (НУЦ Минцифры), которому
+    # certifi не доверяет по умолчанию. Этот пакет учит httpx доверять тем же
+    # сертификатам, что и операционная система (после установки сертификатов
+    # Минцифры в Windows — см. предупреждение в load_config() ниже).
+    import httpx_system_certs  # noqa: F401
+    _HTTPX_SYSTEM_CERTS = True
+except ImportError:
+    _HTTPX_SYSTEM_CERTS = False
+
 
 log = logging.getLogger("max_polling")
 
@@ -30,7 +41,7 @@ def parse_env_text(text: str) -> dict[str, str]:
     комментарии «# ...» (в значении без кавычек комментарий начинается с « #»),
     BOM и CRLF. В двойных кавычках понимаются \\n, \\t, \\", \\\\."""
     out: dict[str, str] = {}
-    for raw in text.lstrip("﻿").splitlines():
+    for raw in text.lstrip("\ufeff").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -92,6 +103,7 @@ class Config:
     owner_id: int = 0
     openrouter_api_key: str = ""
     openrouter_model: str = ""
+    openrouter_max_tokens: int = 8192
     db_path: str = str(SCRIPT_DIR / "max_bot.sqlite3")
     save_dir: Path = SCRIPT_DIR / "incoming_images"
     max_image_bytes: int = 10 * 1024 * 1024
@@ -145,6 +157,7 @@ def build_config(env: Mapping[str, str]) -> Config:
         owner_id=int(owner_raw),
         openrouter_api_key=env["OPENROUTER_API_KEY"].strip(),
         openrouter_model=env["OPENROUTER_MODEL"].strip(),
+        openrouter_max_tokens=_int(env, "OPENROUTER_MAX_TOKENS", 8192, 1, 128000),
         db_path=(env.get("DB_PATH") or "").strip() or str(SCRIPT_DIR / "max_bot.sqlite3"),
         save_dir=Path((env.get("SAVE_DIR") or "").strip() or SCRIPT_DIR / "incoming_images"),
         max_image_bytes=_int(env, "MAX_IMAGE_BYTES", 10 * 1024 * 1024, 1024, 1024 ** 3),
@@ -178,6 +191,9 @@ def load_config() -> Config:
     log.info("журнал: экран и файл %s (хранится запусков: %d)", log_file or "(файл не создан)", CFG.log_keep_runs)
     if not CFG.bot_name:
         log.warning("MAX_BOT_NAME не задан: ссылки-приглашения будут без адреса бота (впишите имя бота в .env)")
+    if not _HTTPX_SYSTEM_CERTS:
+        log.warning("пакет httpx_system_certs не установлен: если сервер использует сертификат НУЦ Минцифры, "
+                    "запросы будут падать с CERTIFICATE_VERIFY_FAILED. Установите: pip install httpx-system-certs")
     log.info("настройки: .env %s; модель=%s; БД=%s; архив=%s дн.; пояс=%s; webhook-снятие=%s",
              f"найден (переменных из файла: {len(loaded)})" if ENV_PATH.exists() else "не найден, использую окружение",
              CFG.openrouter_model, CFG.db_path, CFG.archive_days, CFG.tz.key,

@@ -13,7 +13,7 @@ from . import base, transport
 from .ai import check_model_vision
 from .base import BACKOFF_MAX, ConfigError, MSG, SHUTDOWN_GRACE, load_config, log, redact
 from .max_api import AuthError, TransientApiError, check_webhook, display_name, get_updates, parse_message
-from .owner import handle_owner
+from .owner import handle_callback, handle_owner
 from .people import active_recipients, find_recipient, first_time_stranger, handle_invite_reply, handle_invite_start, handle_recipient_request, has_started, is_recipient, mark_started
 from .storage import claim_mid, inbox_done, inbox_pending, inbox_store, init_db, load_marker, purge_archive, release_mid
 from .transport import alert_owner, send_text
@@ -51,6 +51,9 @@ async def process(update: dict, client: httpx.AsyncClient, replayed: bool = Fals
                 elif not rec:
                     await alert_owner(stranger_text(uid, display_name(update.get("user"))),
                                       key=f"stranger:{uid}", every=86400.0)
+        return
+    if update.get("update_type") == "message_callback":
+        await handle_callback(client, update)
         return
     m = parse_message(update)
     if not m or not m["mid"] or m["sender_id"] is None:

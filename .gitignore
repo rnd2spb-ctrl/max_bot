@@ -1,3 +1,5 @@
+incoming_images/
+logs/
 .env
 __pycache__/
 *.pyc

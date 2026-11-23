@@ -4,12 +4,14 @@ from __future__ import annotations
 import hashlib
 import secrets
 import time
+from pathlib import Path
 from typing import Optional
 import httpx
 from . import base
-from .base import MSG, compose_text, fmt_ts, log, parse_date
+from .base import MSG, MSG_LIMIT, compose_text, fmt_ts, log, parse_date
+from .max_api import ImageUploadError, upload_image
 from .storage import archive_rows, db, filter_rows, q
-from .transport import alert_owner, send_text
+from .transport import alert_owner, send_image, send_text
 
 
 def first_time_stranger(user_id: int) -> bool:
@@ -77,26 +79,67 @@ def parse_names(text: str) -> list[str]:
     return [n.strip() for n in text.splitlines() if n.strip()]
 
 
-def make_links(names: list[str]) -> str:
-    """Создаёт ссылки для имён и возвращает текст ответа владельцу.
-    Ссылка показывается ТОЛЬКО здесь, один раз: в базе лежит лишь хеш токена. Поэтому без
-    MAX_BOT_NAME ссылки не создаются вообще: показанная без адреса бота ссылка была бы потеряна."""
+async def send_links(client: httpx.AsyncClient, uid: int, names: list[str]) -> None:
+    """Создаёт приглашения и одним отчётом показывает успешные ссылки и ошибки.
+
+    Сырые токены не сохраняются в БД и попадают только в этот ответ владельцу.
+    Функция общая для /add, /newlink и мастера первоначальной настройки.
+    """
     if not base.CFG.bot_name:
-        return ("Ссылки не созданы: не задано имя бота. Впишите в файл .env строку "
-                "MAX_BOT_NAME=имя_бота (имя из адреса https://max.ru/имя_бота) и перезапустите бота.")
-    lines = []
+        await send_text(client, uid, "Ссылки не созданы: не задано имя бота. Впишите в файл .env строку "
+                        "MAX_BOT_NAME=имя_бота (имя из адреса https://max.ru/имя_бота) и перезапустите бота.")
+        return
+
+    created: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
     for name in names:
         if len(name) > 40:
-            lines.append(f"{name[:40]}…: слишком длинное имя (до 40 знаков)")
+            failed.append((name, "слишком длинное имя (до 40 знаков)"))
             continue
         busy = name_busy(name)
         if busy:
-            lines.append(f"{name}: {busy}")
+            failed.append((name, busy))
             continue
-        lines.append(f"{name}: {invite_link(create_invite(name))}")
-    return ("\n".join(lines) + f"\n\nКаждая ссылка одноразовая, действует {base.CFG.invite_ttl_hours} ч. "
-            "Ссылка показывается один раз: перешлите её получателю сейчас. Потеряли — /newlink Имя. "
-            "Статусы: /links").strip()
+        link = invite_link(create_invite(name))
+        created.append((name, link))
+
+    # MAX не поддерживает таблицы как отдельный тип разметки. Используем
+    # компактные строки с колонками и Markdown-ссылками, которые остаются кликабельными.
+    header = "**Персональные ссылки**\n\n№ │ Имя │ Ссылка\n"
+    rows = []
+    for number, (name, link) in enumerate(created, 1):
+        safe_name = (name.replace("\\", "\\\\").replace("|", "\\|")
+                     .replace("*", "\\*").replace("_", "\\_").replace("`", "\\`"))
+        rows.append(f"{number} │ {safe_name} │ [{link}]({link})")
+    if created:
+        rows.append("")
+        rows.append(f"Создано ссылок: **{len(created)}**")
+        rows.append(f"Срок действия: {base.CFG.invite_ttl_hours} ч. Каждая ссылка одноразовая.")
+        rows.append("Перешлите ссылки соответствующим получателям. Потеряли ссылку — /newlink Имя.")
+        rows.append("Статусы приглашений — /links.")
+
+    if failed:
+        rows.extend(["", "**Не удалось создать ссылки:**"])
+        rows.extend(f"• {name}: {reason}" for name, reason in failed)
+
+    if not rows:
+        return
+
+    # Разбиваем отчёт только между строками, чтобы ссылки не обрезались.
+    chunks: list[str] = []
+    current = header
+    for row in rows:
+        candidate = current + row + "\n"
+        if len(candidate) > MSG_LIMIT - 100 and current != header:
+            chunks.append(current.rstrip())
+            current = header + row + "\n"
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    for chunk in chunks:
+        await send_text(client, uid, chunk, format="markdown")
 
 
 # =====================================================================
@@ -139,6 +182,35 @@ async def deliver(client: httpx.AsyncClient, archive_id: int, ts: float, text: s
         else:
             failed.append(name)
             log.warning("не доставлено %s (%s): %s", name, uid, MSG["send_failed"])
+    return ok, failed
+
+
+async def deliver_image(client: httpx.AsyncClient, archive_id: int, image_path: str,
+                        recs: list[tuple[int, str]]) -> tuple[int, list[str]]:
+    """Рассылает исходную картинку (кнопка «Картинка»): файл загружается в MAX один раз
+    (upload_image), затем получателям уходит ссылка на этот же загруженный файл. Если
+    загрузка не удалась (например, файл уже удалён по сроку хранения архива) -- все
+    получатели считаются недоставленными, в журнал пишется причина."""
+    ok, failed = 0, []
+    try:
+        image_payload = await upload_image(client, Path(image_path))
+    except (ImageUploadError, OSError) as e:
+        log.error("рассылка картинки записи №%d: загрузка не удалась: %s", archive_id, e)
+        for uid, name in recs:
+            db("INSERT INTO deliveries (archive_id, recipient_id, status, ts) VALUES (?, ?, ?, ?)",
+               (archive_id, uid, "fail", time.time()))
+            failed.append(name)
+        return 0, failed
+    for uid, name in recs:
+        status = await send_image(client, uid, image_payload)
+        db("INSERT INTO deliveries (archive_id, recipient_id, status, ts) VALUES (?, ?, ?, ?)",
+           (archive_id, uid, "ok" if status == "ok" else "fail", time.time()))
+        if status == "ok":
+            ok += 1
+        else:
+            failed.append(name)
+            log.warning("не доставлена картинка %s (%s): %s", name, uid,
+                       MSG["not_started"] if status == "rejected" and not has_started(uid) else MSG["send_failed"])
     return ok, failed
 
 

@@ -45,9 +45,11 @@ def parse_retry_after(raw: str) -> Optional[float]:
         return None
 
 
-async def send_message(client: httpx.AsyncClient, user_id: int, text: str) -> str:
-    """Одно сообщение. Возвращает «ok», «rejected» (4xx, кроме 429: чаще всего
-    пользователь не нажал Start) или «failed» (сеть/429/5xx после повторов)."""
+async def _post_message(client: httpx.AsyncClient, user_id: int, body: dict) -> str:
+    """Общая отправка POST /messages с паузами (0.5 с на чат) и повтором. Используется
+    и для текста (send_message), и для картинки (send_image) -- тело запроса разное,
+    логика повторов и лимитов одна. Возвращает «ok», «rejected» (4xx, кроме 429: чаще
+    всего пользователь не нажал Start) или «failed» (сеть/429/5xx после повторов)."""
     lock = _send_locks.setdefault(user_id, asyncio.Lock())
     async with lock:
         for attempt in range(SEND_ATTEMPTS):
@@ -60,7 +62,7 @@ async def send_message(client: httpx.AsyncClient, user_id: int, text: str) -> st
                     f"{API}/messages",
                     params={"user_id": user_id},
                     headers={"Authorization": base.CFG.bot_token},
-                    json={"text": text[:MSG_LIMIT]},
+                    json=body,
                     timeout=15,
                 )
             except httpx.HTTPError as e:
@@ -82,10 +84,50 @@ async def send_message(client: httpx.AsyncClient, user_id: int, text: str) -> st
         return "failed"
 
 
-async def send_text(client: httpx.AsyncClient, user_id: int, text: str) -> str:
-    """Длинный текст уходит частями до 4000 символов с пометками «(1/N)». При сбое части — стоп."""
+async def send_message(client: httpx.AsyncClient, user_id: int, text: str,
+                       attachments: Optional[list[dict]] = None,
+                       format: Optional[str] = None) -> str:
+    """Одно сообщение, при желании с вложениями и форматированием MAX.
+    Возвращает «ok», «rejected» или «failed» -- см. _post_message."""
+    body: dict = {"text": text[:MSG_LIMIT]}
+    if attachments:
+        body["attachments"] = attachments
+    if format:
+        body["format"] = format
+    return await _post_message(client, user_id, body)
+
+
+async def send_image(client: httpx.AsyncClient, user_id: int, image_payload: dict) -> str:
+    """Отправляет картинку как вложение. image_payload -- то, что вернула upload_image()
+    (max_api.py): {"token": ...} либо {"photos": {...}}. Текста при этом не посылаем."""
+    return await _post_message(client, user_id, {"attachments": [{"type": "image", "payload": image_payload}]})
+
+
+async def answer_callback(client: httpx.AsyncClient, callback_id: str, text: Optional[str] = None) -> bool:
+    """Отвечает на нажатие inline-кнопки (POST /answers). message.attachments=[] убирает
+    клавиатуру из исходного сообщения, чтобы повторное нажатие было невозможно.
+    Не критично для доставки результата: сбой только пишется в журнал."""
+    body: dict = {"message": {"attachments": []}}
+    if text is not None:
+        body["message"]["text"] = text[:MSG_LIMIT]
+    try:
+        r = await client.post(f"{API}/answers", params={"callback_id": callback_id},
+                              headers={"Authorization": base.CFG.bot_token}, json=body, timeout=15)
+    except httpx.HTTPError as e:
+        log.warning("ответ на callback %s: сетевая ошибка %r", callback_id, e)
+        return False
+    if r.status_code != 200:
+        log.warning("ответ на callback %s: HTTP %s %s", callback_id, r.status_code, r.text[:200])
+        return False
+    return True
+
+
+async def send_text(client: httpx.AsyncClient, user_id: int, text: str,
+                    format: Optional[str] = None) -> str:
+    """Длинный текст уходит частями до 4000 символов с пометками «(1/N)».
+    При необходимости включает форматирование MAX. При сбое части — стоп."""
     for part in split_text(text):
-        status = await send_message(client, user_id, part)
+        status = await send_message(client, user_id, part, format=format)
         if status != "ok":
             return status
     return "ok"
