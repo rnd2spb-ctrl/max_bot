@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from html.parser import HTMLParser
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from typing import Awaitable, Callable, Mapping, Optional
@@ -19,6 +21,86 @@ _last_send: dict[int, float] = {}
 _send_locks: dict[int, asyncio.Lock] = {}
 
 SEND_ATTEMPTS = 5
+
+
+class _VisibleTextParser(HTMLParser):
+    """Извлекает отображаемый текст из HTML-сообщения MAX для журнала."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag.lower() == "br":
+            self.parts.append("\n")
+
+
+def _chat_label(user_id: int) -> str:
+    """Определяет адресата исходящего сообщения без обращения к сетевому API."""
+    if user_id == base.CFG.owner_id:
+        return f"владелец user_id={user_id}"
+
+    try:
+        # Локальный импорт нужен, чтобы не создавать циклическую зависимость при старте.
+        from .storage import q
+
+        rows = q("SELECT name FROM recipients WHERE user_id = ?", (user_id,))
+        if rows:
+            return f"получатель «{rows[0][0]}» user_id={user_id}"
+
+        rows = q(
+            "SELECT name FROM invites WHERE user_id = ? "
+            "AND status = 'ждёт подтверждения' ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+        if rows:
+            return f"пользователь по приглашению «{rows[0][0]}» user_id={user_id}"
+    except Exception:
+        # Журналирование не должно мешать самой отправке, например до открытия БД.
+        pass
+
+    return f"user_id={user_id}"
+
+
+def _visible_message_text(text: str, message_format: Optional[str]) -> str:
+    """Текст в журнале соответствует видимому содержимому сообщения; секреты скрываются."""
+    visible = text
+    if message_format == "html":
+        parser = _VisibleTextParser()
+        try:
+            parser.feed(text)
+            visible = "".join(parser.parts)
+        except Exception:
+            visible = re.sub(r"<[^>]*>", "", text)
+
+    visible = redact(visible)
+    # Токены одноразовых ссылок не должны сохраняться в лог-файлах.
+    visible = re.sub(
+        r"(https?://max\.ru/[^\s<>\"]+\?start=)[^\s&<>\"]+",
+        lambda match: match.group(1) + "[ТОКЕН СКРЫТ]",
+        visible,
+        flags=re.IGNORECASE,
+    )
+    return visible
+
+
+def _log_outgoing_message(
+    user_id: int, text: str, message_format: Optional[str], status: str,
+) -> None:
+    """Пишет в журнал именно текст, переданный MAX, и результат его отправки."""
+    recipient = _chat_label(user_id)
+    visible = _visible_message_text(text, message_format)
+    indented = "\n".join("    " + line for line in visible.splitlines()) or "    [сообщение без текста]"
+    if status == "ok":
+        log.info("исходящее сообщение доставлено → %s:\n%s", recipient, indented)
+    else:
+        log.warning(
+            "исходящее сообщение не доставлено → %s (статус=%s):\n%s",
+            recipient, status, indented,
+        )
 
 
 def retry_after_seconds(headers: Mapping[str, str], default: float, cap: float = 30.0) -> float:
@@ -94,7 +176,9 @@ async def send_message(client: httpx.AsyncClient, user_id: int, text: str,
         body["attachments"] = attachments
     if format:
         body["format"] = format
-    return await _post_message(client, user_id, body)
+    status = await _post_message(client, user_id, body)
+    _log_outgoing_message(user_id, body["text"], format, status)
+    return status
 
 
 async def send_image(client: httpx.AsyncClient, user_id: int, image_payload: dict) -> str:

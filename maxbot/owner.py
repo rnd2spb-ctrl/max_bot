@@ -13,7 +13,7 @@ from .base import DEFAULT_PROMPT, MSG, compose_text, fmt_ts, log, redact, split_
 from .max_api import ImageError, download_image
 from .people import (
     active_recipients, delivery_summary, dispatch_archive, find_recipient,
-    invite_view, parse_names_with_org, send_links,
+    invite_view, parse_names, parse_names_with_org, send_links,
 )
 from .storage import (
     archive_add, archive_rows, db, del_setting, filter_rows, get_prompt, get_setting,
@@ -27,15 +27,16 @@ HELP = """/recipients — список получателей
 /links — статусы ссылок
 /newlink [имя] [код] — перевыпустить ссылки (одно или несколько имён, каждое с новой строки)
 Код после имени: 1 — Озон, 2 — WB, 3 — обе организации (по умолчанию).
-/revoke [имя] — отозвать неиспользованную ссылку
-/remove [имя или ID] — удалить получателя
+/revoke [имя] — отозвать неиспользованную ссылку; несколько имён — каждое с новой строки
+/remove [имя или ID] — удалить подключённого получателя; несколько имён/ID — каждое с новой строки
 /pause [имя или ID] — временно не слать получателю
 /resume [имя или ID] — снова слать получателю
 /archive [N] — последние N записей (по умолчанию 10)
 /archive find [слово или дата] — поиск в архиве
-/resend [номер] [получатель или все] [текст|картинка] — продолжить рассылку; формат обязателен, если ещё не выбран
+/resend [номер] [получатель или все] [текст|картинка] — продолжить рассылку; несколько получателей — каждое с новой строки; формат обязателен, если ещё не выбран
 /prompt — показать промпт
 /prompt set [текст] — заменить промпт
+/prompt reset — вернуть стандартный промпт
 /status — состояние
 /help — этот список"""
 
@@ -80,21 +81,81 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
                     log.info("перевыпуск ссылки: %s, отозвано старых: %s", name, n)
             await send_links(client, owner_id, names)
     elif cmd == "/revoke":
-        n = db("UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
-               "AND status IN ('ожидает', 'ждёт подтверждения')", (arg,)).rowcount
-        if n:
-            await reply(f"Ссылка для «{arg}» отозвана. Старая ссылка больше не работает.")
-        elif find_recipient(arg):
-            await reply(f"{arg} уже подключён(а): чтобы убрать из рассылки, используйте /remove.")
-        else:
-            await reply(f"Активной ссылки для «{arg}» нет.")
+        names = list(dict.fromkeys(parse_names(arg)))
+        if not names:
+            await reply("Формат: /revoke Имя. Несколько имён — каждое с новой строки.")
+            return
+
+        results = []
+        for name in names:
+            n = db(
+                "UPDATE invites SET status = 'отозвана' WHERE lower(name) = lower(?) "
+                "AND status IN ('ожидает', 'ждёт подтверждения')",
+                (name,),
+            ).rowcount
+            if n:
+                results.append(f"«{name}»: отозвано ссылок: {n}.")
+                continue
+
+            rec = find_recipient(name)
+            if rec:
+                results.append(
+                    f"«{rec[1]}»: уже подключён (ID {rec[0]}); для удаления используйте /remove."
+                )
+            else:
+                results.append(f"«{name}»: активная ссылка не найдена.")
+
+        await reply("\n".join(results))
     elif cmd == "/remove":
-        rec = find_recipient(arg)
-        if not rec:
-            await reply("Получатель не найден.")
-        else:
-            set_setting("pending", json.dumps({"type": "remove", "user_id": rec[0]}))
-            await reply(f"Удалить {rec[1]}? Ответьте «да».")
+        names = list(dict.fromkeys(parse_names(arg)))
+        if not names:
+            await reply("Формат: /remove Имя или ID. Несколько имён/ID — каждое с новой строки.")
+            return
+
+        targets = []
+        seen_ids = set()
+        pending_invites = []
+        missing = []
+        for name in names:
+            rec = find_recipient(name)
+            if rec:
+                if rec[0] not in seen_ids:
+                    targets.append(rec)
+                    seen_ids.add(rec[0])
+            elif q(
+                "SELECT 1 FROM invites WHERE lower(name) = lower(?) "
+                "AND status IN ('ожидает', 'ждёт подтверждения') LIMIT 1",
+                (name,),
+            ):
+                pending_invites.append(name)
+            else:
+                missing.append(name)
+
+        if not targets:
+            messages = []
+            if pending_invites:
+                messages.append(
+                    "Ещё не подключились (для отзыва приглашений используйте /revoke): "
+                    + ", ".join(pending_invites) + "."
+                )
+            if missing:
+                messages.append("Не найдены: " + ", ".join(missing) + ".")
+            await reply("\n".join(messages) or "Подключённые получатели не найдены.")
+            return
+
+        set_setting("pending", json.dumps({
+            "type": "remove",
+            "targets": [list(rec) for rec in targets],
+        }))
+        message = "Удалить получателей: " + ", ".join(rec[1] for rec in targets) + "? Ответьте «да»."
+        if pending_invites:
+            message += (
+                "\nЕщё не подключились (для отзыва приглашений используйте /revoke): "
+                + ", ".join(pending_invites) + "."
+            )
+        if missing:
+            message += "\nНе найдены: " + ", ".join(missing) + "."
+        await reply(message)
     elif cmd == "/archive":
         rows = archive_rows()
         if arg.lower().startswith("find"):
@@ -103,7 +164,7 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
             rows = rows[: int(arg) if arg.isdigit() else 10]
         await reply("\n".join(f"{r[0]}. {fmt_ts(r[1])} — {r[2]} [{r[4]}]" for r in rows) or "Записей нет.")
     elif cmd == "/resend":
-        m = re.fullmatch(r"(\d+)\s+(.+?)(?:\s+(текст|картинка))?", arg, flags=re.IGNORECASE)
+        m = re.fullmatch(r"(\d+)\s+(.+?)(?:\s+(текст|картинка))?", arg, flags=re.IGNORECASE | re.DOTALL)
         rows = q(
             "SELECT id, ts, title, text, status, org FROM archive WHERE id = ?",
             (int(m.group(1)),),
@@ -140,13 +201,35 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
                 return
             selected_kind = requested_kind
 
+        not_found = []
+        paused = []
         if recipient_arg.lower() == "все":
             targets = recipients_for_org(int(row[5]))
         else:
-            rec = find_recipient(recipient_arg)
-            targets = [rec] if rec else []
+            targets = []
+            seen_ids = set()
+            for requested_name in parse_names(recipient_arg):
+                rec = find_recipient(requested_name)
+                if not rec:
+                    not_found.append(requested_name)
+                    continue
+                if rec[0] in seen_ids:
+                    continue
+                seen_ids.add(rec[0])
+                if not q("SELECT 1 FROM recipients WHERE user_id = ? AND active = 1", (rec[0],)):
+                    paused.append(rec[1])
+                    continue
+                targets.append(rec)
+
         if not targets:
-            await reply("Получатель не найден или нет активных получателей для организации этой записи.")
+            messages = []
+            if paused:
+                messages.append("На паузе (не включены в отправку): " + ", ".join(paused) + ".")
+            if not_found:
+                messages.append("Не найдены: " + ", ".join(not_found) + ".")
+            if not messages:
+                messages.append("Нет активных получателей для организации этой записи.")
+            await reply("\n".join(messages))
             return
         set_setting("pending", json.dumps({
             "type": "resend",
@@ -155,10 +238,18 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
             "targets": [list(t) for t in targets],
         }))
         kind_label = "текст" if selected_kind == "text" else "картинка"
-        await reply(
+        confirmation = (
             f"Отправить повторно №{row[0]} «{row[2]}» ({kind_label}) → "
             f"{', '.join(t[1] for t in targets)}? Ответьте «да»."
         )
+        notes = []
+        if paused:
+            notes.append("На паузе (не включены): " + ", ".join(paused) + ".")
+        if not_found:
+            notes.append("Не найдены: " + ", ".join(not_found) + ".")
+        if notes:
+            confirmation += "\n" + "\n".join(notes)
+        await reply(confirmation)
     elif cmd in ("/pause", "/resume"):
         rec = find_recipient(arg)
         if not rec:
@@ -168,7 +259,10 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
             db("UPDATE recipients SET active = ? WHERE user_id = ?", (active, rec[0]))
             await reply(f"{rec[1]}: {'включён' if active else 'отключён, рассылки не получает'}.")
     elif cmd == "/prompt":
-        if arg.lower().startswith("set"):
+        if arg.lower() == "reset":
+            del_setting("prompt")
+            await reply("Промпт сброшен на стандартный:\n\n" + get_prompt())
+        elif arg.lower().startswith("set"):
             new = arg[3:].strip()
             if not new:
                 await reply("Формат: /prompt set [новый текст]")
@@ -192,12 +286,31 @@ async def handle_owner_command(client: httpx.AsyncClient, owner_id: int, text: s
 
 async def execute_pending(client: httpx.AsyncClient, owner_id: int, p: dict) -> None:
     if p["type"] == "remove":
-        db("DELETE FROM recipients WHERE user_id = ?", (p["user_id"],))
-        db(
-            "DELETE FROM dispatch_recipients WHERE recipient_id = ? AND status != 'ok'",
-            (p["user_id"],),
-        )
-        await send_text(client, owner_id, "Получатель удалён.")
+        targets = p.get("targets")
+        if targets is None:  # совместимость с ранее сохранённым одиночным подтверждением
+            user_id = p["user_id"]
+            rows = q("SELECT name FROM recipients WHERE user_id = ?", (user_id,))
+            name = rows[0][0] if rows else str(user_id)
+            targets = [[user_id, name]]
+
+        removed = []
+        for user_id, name in targets:
+            deleted = db("DELETE FROM recipients WHERE user_id = ?", (user_id,)).rowcount
+            db(
+                "DELETE FROM dispatch_recipients WHERE recipient_id = ? AND status != 'ok'",
+                (user_id,),
+            )
+            if deleted:
+                removed.append(name)
+
+        if removed:
+            if len(removed) == 1:
+                result_text = f"Получатель «{removed[0]}» удалён."
+            else:
+                result_text = "Получатели удалены: " + ", ".join(removed) + "."
+        else:
+            result_text = "Выбранные получатели уже отсутствуют."
+        await send_text(client, owner_id, result_text)
     elif p["type"] == "set_prompt":
         set_setting("prompt", p["text"])
         await send_text(client, owner_id, "Промпт заменён.")
@@ -233,7 +346,24 @@ def dispatch_result_text(result: dict, prefix: str = "Рассылка") -> str:
                 "Чтобы не допустить повторную или смешанную рассылку, автоматический повтор для неё заблокирован.")
     if state == "expired":
         return "Срок действия кнопок истёк. Для повторной отправки используйте /resend."
+    if state == "already_delivered":
+        names = result.get("already_received", [])
+        if len(names) == 1:
+            return (
+                f"Материал уже доставлен получателю «{names[0]}». "
+                "Повторная отправка не выполнялась, чтобы не создавать дубликат."
+            )
+        if names:
+            return (
+                "Материал уже доставлен выбранным получателям: "
+                + ", ".join(names)
+                + ". Повторная отправка не выполнялась, чтобы не создавать дубликаты."
+            )
+        return "Все выбранные получатели уже получили этот материал; повторная отправка не выполнялась, чтобы не создавать дубликаты."
     if state == "completed":
+        if "total" in result and int(result["total"]) == 0:
+            return ("Все получатели этого материала сейчас на паузе: рассылка не выполнена. "
+                    "После /resume доставьте его командой /resend <номер> <имя>.")
         return "Все выбранные получатели уже получили этот материал."
     if state == "no_recipients":
         return MSG["no_recipients"]
@@ -252,9 +382,7 @@ def dispatch_result_text(result: dict, prefix: str = "Рассылка") -> str:
     ok = int(result.get("ok", 0))
     total = int(result.get("total", 0))
     failed = result.get("failed", [])
-    suffix = delivery_summary(ok, total, failed)
-    if state == "completed":
-        suffix = f"Отправлено: {ok} из {total}."
+    suffix = delivery_summary(ok, total, failed, paused=int(result.get("paused", 0)))
     return f"{prefix} ({kind_text}). {suffix}"
 
 
@@ -280,11 +408,13 @@ async def setup_wizard(client: httpx.AsyncClient, uid: int, text: str) -> None:
         await send_text(client, uid, s)
 
     if step == "start":
+        del_setting("prompt_draft")                 # старый черновик из прошлой настройки не должен попасть в промпт
         set_setting("setup_step", "prompt")
         await say("Первоначальная настройка. " + wizard_question("prompt"))
     elif step == "prompt":
         if text.lower() == "да":
             set_setting("prompt", get_setting("prompt_draft") or DEFAULT_PROMPT)
+            del_setting("prompt_draft")
             set_setting("setup_step", "recipients")
             await say(wizard_question("recipients"))
         else:

@@ -257,7 +257,7 @@ async def poll_loop(client: httpx.AsyncClient, max_polls: Optional[int] = None) 
                 retry_client=client if is_callback else None,
             )
         if updates:
-            log.info("получено обновлений: %d, marker=%s", len(updates), marker)
+            log.debug("получено обновлений: %d, marker=%s", len(updates), marker)
         elif time.monotonic() - started < 0.2:       # сервер ответил мгновенно и пусто: не крутим CPU
             await transport._sleep(1.0)
 

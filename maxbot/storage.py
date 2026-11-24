@@ -282,6 +282,16 @@ def active_recipient_ids(ids: list[int]) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
+def paused_recipients_for_archive(archive_id: int) -> int:
+    """Сколько получателей организации этой записи сейчас на паузе."""
+    rows = q(
+        "SELECT COUNT(*) FROM recipients r WHERE r.active = 0 AND "
+        "(r.org & (SELECT a.org FROM archive a WHERE a.id = ?)) != 0",
+        (archive_id,)
+    )
+    return int(rows[0][0]) if rows else 0
+
+
 def archive_add(
     ts: float, title: str, text: str, image_path: str, status: str,
     buttons_expires_ts: Optional[float] = None, org: int = 3,
@@ -383,24 +393,28 @@ def claim_archive_dispatch(
             else:
                 pending = c.execute(
                     "SELECT recipient_id FROM dispatch_recipients "
-                    "WHERE archive_id = ? AND status != 'ok' LIMIT 1",
+                    "WHERE archive_id = ? AND status NOT IN ('ok', 'skipped') LIMIT 1",
                     (archive_id,)
                 ).fetchone()
 
             if pending is None:
+                # Пропущенные из-за паузы не считаются недоставленными: запись завершается,
+                # если все остальные адресаты получили материал.
                 total, ok = c.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) "
+                    "SELECT COUNT(CASE WHEN status != 'skipped' THEN 1 END), "
+                    "COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) "
                     "FROM dispatch_recipients WHERE archive_id = ?",
                     (archive_id,)
                 ).fetchone()
-                if total and ok == total:
+                if ok == total:
                     c.execute(
                         "UPDATE archive_dispatch SET status = 'completed', lease_until = NULL, "
                         "lease_token = NULL, updated_ts = ? WHERE archive_id = ?",
                         (now, archive_id)
                     )
                     c.commit()
-                    return {"state": "completed", "kind": selected_kind}
+                    return {"state": "completed", "kind": selected_kind,
+                            "total": int(total), "ok": int(ok)}
                 c.commit()
                 return {"state": "no_pending_targets", "kind": selected_kind}
 
@@ -422,7 +436,7 @@ def claim_archive_dispatch(
         else:
             pending = c.execute(
                 "SELECT recipient_id, recipient_name, status FROM dispatch_recipients "
-                "WHERE archive_id = ? AND status != 'ok' ORDER BY rowid",
+                "WHERE archive_id = ? AND status NOT IN ('ok', 'skipped') ORDER BY rowid",
                 (archive_id,)
             ).fetchall()
         c.commit()
@@ -508,6 +522,31 @@ def record_dispatch_delivery(
         )
 
 
+def record_dispatch_skipped(archive_id: int, recipient_id: int, lease_token: str) -> bool:
+    """Отмечает адресата пропущенным, потому что он на паузе или удалён.
+
+    Статус терминальный и не блокирует завершение записи. После /resume материал
+    автоматически не доставляется: для доставки нужен /resend <id> <имя>.
+    """
+    now = time.time()
+    c = _conn()
+    with c:
+        lease = c.execute(
+            "SELECT 1 FROM archive_dispatch WHERE archive_id = ? "
+            "AND status = 'sending' AND lease_token = ?",
+            (archive_id, lease_token)
+        ).fetchone()
+        if lease is None:
+            raise RuntimeError("аренда рассылки потеряна до пропуска получателя")
+        cur = c.execute(
+            "UPDATE dispatch_recipients SET status = 'skipped', updated_ts = ?, "
+            "last_error = 'Пропущен: получатель на паузе или удалён' "
+            "WHERE archive_id = ? AND recipient_id = ? AND status != 'ok'",
+            (now, archive_id, recipient_id)
+        )
+    return cur.rowcount == 1
+
+
 def finish_archive_dispatch(
     archive_id: int, lease_token: str, error: Optional[str] = None,
 ) -> dict:
@@ -529,17 +568,19 @@ def finish_archive_dispatch(
             "WHERE archive_id = ? AND status = 'sending'",
             (now, error, archive_id)
         )
-        total, ok = c.execute(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0) "
+        total, ok, skipped = c.execute(
+            "SELECT COUNT(CASE WHEN status != 'skipped' THEN 1 END), "
+            "COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0) "
             "FROM dispatch_recipients WHERE archive_id = ?",
             (archive_id,)
         ).fetchone()
         failed = c.execute(
             "SELECT recipient_name FROM dispatch_recipients "
-            "WHERE archive_id = ? AND status != 'ok' ORDER BY rowid",
+            "WHERE archive_id = ? AND status NOT IN ('ok', 'skipped') ORDER BY rowid",
             (archive_id,)
         ).fetchall()
-        state = "completed" if total and ok == total else "partial"
+        state = "completed" if ok == total else "partial"
         c.execute(
             "UPDATE archive_dispatch SET status = ?, lease_until = NULL, lease_token = NULL, "
             "updated_ts = ?, last_error = ? WHERE archive_id = ? AND lease_token = ?",
@@ -549,6 +590,7 @@ def finish_archive_dispatch(
         "state": state,
         "total": int(total),
         "ok": int(ok),
+        "skipped": int(skipped),
         "failed": [row[0] for row in failed],
         "error": error,
     }

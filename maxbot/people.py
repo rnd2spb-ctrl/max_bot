@@ -14,7 +14,8 @@ from .max_api import upload_image
 from .storage import (
     archive_rows, claim_archive_dispatch, db, dispatch_recipients, filter_rows,
     active_recipient_ids, finish_archive_dispatch, mark_dispatch_recipient_sending,
-    q, recipients_for_org, record_dispatch_delivery, touch_archive_dispatch,
+    paused_recipients_for_archive, q, recipients_for_org, record_dispatch_delivery,
+    record_dispatch_skipped, touch_archive_dispatch,
 )
 from .transport import alert_owner, send_image, send_text
 
@@ -212,6 +213,18 @@ async def dispatch_archive(
         default_kind="text",
     )
     if claim["state"] != "claimed":
+        if extend_recipients and claim["state"] in ("completed", "no_pending_targets"):
+            target_ids = {uid for uid, _ in recs}
+            current_rows = dispatch_recipients(archive_id)
+            status_by_id = {uid: status for uid, _name, status in current_rows}
+            if target_ids and all(status_by_id.get(uid) == "ok" for uid in target_ids):
+                name_by_id = {uid: name for uid, name in recs}
+                claim["state"] = "already_delivered"
+                claim["already_received"] = [
+                    name_by_id[uid] for uid, _name, status in current_rows
+                    if uid in target_ids and status == "ok"
+                ]
+                claim["kind"] = claim.get("kind") or kind
         return claim
 
     # claim_archive_dispatch может вернуть старые строки dispatch_recipients.
@@ -220,6 +233,11 @@ async def dispatch_archive(
     eligible = active_recipient_ids(claimed_ids)
     current_targets = {uid for uid, _ in recs}
     eligible.intersection_update(current_targets)
+    # Адресаты, которых нельзя отправить сейчас (пауза, удаление, другая организация),
+    # получают статус skipped: это терминальный статус и не блокирует завершение записи.
+    for uid in claimed_ids:
+        if uid not in eligible:
+            record_dispatch_skipped(archive_id, uid, claim["lease_token"])
 
     target_ids = {uid for uid, _ in recs} if extend_recipients else None
 
@@ -228,12 +246,13 @@ async def dispatch_archive(
         if target_ids is not None:
             selected = [
                 row for row in dispatch_recipients(archive_id)
-                if row[0] in target_ids
+                if row[0] in target_ids and row[2] != "skipped"
             ]
             result["total"] = len(selected)
             result["ok"] = sum(1 for row in selected if row[2] == "ok")
             result["failed"] = [row[1] for row in selected if row[2] != "ok"]
         result["kind"] = claim["kind"]
+        result["paused"] = paused_recipients_for_archive(archive_id)
         return result
 
     lease_token = claim["lease_token"]
@@ -288,6 +307,8 @@ async def dispatch_archive(
             # Повторная проверка непосредственно перед отправкой закрывает паузу/удаление,
             # произошедшие уже после первоначальной проверки списка.
             if uid not in active_recipient_ids([uid]):
+                record_dispatch_skipped(archive_id, uid, lease_token)
+                log.info("пропуск получателя %s (%s): поставлен на паузу во время рассылки", name, uid)
                 continue
             if not mark_dispatch_recipient_sending(archive_id, uid, lease_token):
                 continue
@@ -330,14 +351,17 @@ async def dispatch_archive(
     return scope_result(result)
 
 
-def delivery_summary(ok: int, total: int, failed: list[str]) -> str:
-    """«Отправлено: N из M. Не доставлено: [имена].»"""
+def delivery_summary(ok: int, total: int, failed: list[str], paused: Optional[int] = None) -> str:
+    """«Отправлено: N из M. Не доставлено: [имена]. Пропущено (на паузе): K.»"""
     s = f"Отправлено: {ok} из {total}."
     if failed:
         s += " Не доставлено: " + ", ".join(failed) + "."
-    paused = q("SELECT COUNT(*) FROM recipients WHERE active = 0")[0][0]
-    if paused:
-        s += f" Отключено (рассылку не получают): {paused}."
+    if paused is None:
+        paused = q("SELECT COUNT(*) FROM recipients WHERE active = 0")[0][0]
+        if paused:
+            s += f" Отключено (рассылку не получают): {paused}."
+    elif paused:
+        s += f" Пропущено (на паузе): {paused}."
     return s
 
 
